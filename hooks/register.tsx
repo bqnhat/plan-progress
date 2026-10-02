@@ -12,6 +12,7 @@ const isOpen = atom({ plugin: 'plan-progress', key: 'isOpen' } as const, true)
 const tick = atom({ plugin: 'plan-progress', key: 'tick' } as const, 0)
 const isRestoreChecked = atom({ plugin: 'plan-progress', key: 'isRestoreChecked' } as const, false)
 const isExpanded = atom({ plugin: 'plan-progress', key: 'isExpanded' } as const, false)
+const backgroundTaskIds = atom({ plugin: 'plan-progress', key: 'backgroundTaskIds' } as const, [])
 const STRIP_H = 18
 const STRIP_GAP = 3
 const MAX_STRIPS = 4 // past this, the finished ones fold into one "+N more" strip
@@ -584,6 +585,28 @@ const WORK_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'Bash'
 const WORK_BEFORE_PLAN = 3 // the 4th changing call without a plan is refused once
 const CALLS_BEFORE_NUDGE = 6 // working calls without a plan update before a reminder
 
+const TASK_NOTIFICATION = /<task-notification>([\s\S]*?)<\/task-notification>/g
+
+function launchedTaskId(tool: string, result: unknown): string {
+  const r = result && typeof result === 'object' ? (result as Raw) : {}
+  if (tool === 'Bash' || tool === 'PowerShell') return str(r.backgroundTaskId, 80)
+  if (tool === 'Monitor') return str(r.taskId, 80)
+  return r.status === 'async_launched' || r.status === 'remote_launched' ? str(r.taskId, 80) || str(r.agentId, 80) : ''
+}
+
+async function noteLaunch($: EngineInterface, tool: string, result: unknown) {
+  const taskId = launchedTaskId(tool, result)
+  if (taskId) await update($, backgroundTaskIds, ids => [...ids.filter(id => id !== taskId), taskId])
+}
+
+function endedTaskIds(text: string): string[] {
+  return [...text.matchAll(TASK_NOTIFICATION)]
+    .map(m => m[1] ?? '')
+    .filter(body => !/<status>\s*running\s*<\/status>/.test(body))
+    .map(body => str(/<task-id>([^<]*)<\/task-id>/.exec(body)?.[1], 80))
+    .filter(id => id !== '')
+}
+
 // an open bar at the end of a turn: a question to the user marks it waiting on its own;
 // only a turn that did work and left the bar unexplained is sent back once
 async function sendBackOpenBars($: EngineInterface, answer: string, didWork: boolean): Promise<boolean> {
@@ -622,7 +645,6 @@ async function replayBars($: EngineInterface): Promise<boolean> {
   for (const message of messages) {
     const isPersonTyping = message.role === 'user' && message.text.trim() !== '' && (message.toolResults ?? []).length === 0
     if (isPersonTyping && CLEAR_COMMAND.test(message.text)) replayed = []
-    else if (isPersonTyping) replayed = replayed.map(p => (p.state === 'needs_input' ? { ...p, state: 'running', note: null } : p))
     for (const use of message.toolUses) {
       if (use.tool === TOOL) callIndex += 1
       if (use.tool !== TOOL || use.isError === true || use.text === undefined) continue
@@ -648,7 +670,6 @@ export const register: Register = on => {
   let sinceUpdate = 0
   let isPlanTouched = false
   let hasRefused = false
-  let isWaitingOnBackground = false
 
   let isRulesSent = false
   let hasSentBack = false
@@ -659,7 +680,6 @@ export const register: Register = on => {
     sinceUpdate = 0
     isPlanTouched = false
     hasRefused = false
-    isWaitingOnBackground = false
     await restoreBarsOnce($)
     if (isPersonPrompt) await foldFinished($)
     isPersonPrompt = false
@@ -667,10 +687,11 @@ export const register: Register = on => {
     return next(e)
   })
 
-  // the rules ride the session's first prompt; a message only carries one short line when bars are open,
-  // and the person answering clears any "needs input" without a model call
+  // the rules ride the session's first prompt; a message only carries one short line when bars are open
   on('prompt.submit', async ($, e, next) => {
     if (e.origin.kind !== 'plugin' || e.origin.name !== 'plan-progress') hasSentBack = false
+    const ended = e.origin.kind === 'task-notification' ? endedTaskIds(e.text) : []
+    if (ended.length > 0) await update($, backgroundTaskIds, ids => ids.filter(id => !ended.includes(id)))
     if (e.origin.kind === 'composer' || e.origin.kind === 'bridge') isPersonPrompt = true
     const enter = async (entering: typeof e) => {
       if (isRulesSent) return next(entering)
@@ -680,16 +701,12 @@ export const register: Register = on => {
       return entered
     }
     if (e.origin.kind !== 'composer') return enter(e)
-    const list = await read($, plans)
-    if (list.some(p => p.state === 'needs_input')) {
-      await update($, plans, all => all.map(p => (p.state === 'needs_input' ? { ...p, state: 'running' as const, note: null } : p)))
-    }
-    const open = list.filter(p => p.state !== 'done' && p.id !== AGENTS)
+    const open = (await read($, plans)).filter(p => p.state !== 'done' && p.id !== AGENTS)
     if (open.length === 0) return enter(e)
     const line = `plan-progress open bars: ${open
       .map(p => {
         const w = where(p)
-        return `${p.id} (${p.stages[w.stage]?.name ?? ''} ${w.step}/${w.stageSize})`
+        return `${p.id} (${p.stages[w.stage]?.name ?? ''} ${w.step}/${w.stageSize}${p.state === 'running' ? '' : `, ${p.state}`})`
       })
       .join(', ')}`
 
@@ -723,15 +740,21 @@ export const register: Register = on => {
       if (waiting.delete(agentId)) await editAgent($, agentId, a => (a.state === 'waiting' ? { ...a, state: 'running' } : a))
       return ran
     }
-    if (!WORK_TOOLS.has(e.tool)) return next(e)
-    isWaitingOnBackground = (e as unknown as Raw).run_in_background === true
-    const hasLivePlan = isPlanTouched || (await read($, plans)).some(isOpenPlan)
-    if (!hasLivePlan && !hasRefused && workCalls >= WORK_BEFORE_PLAN) {
+    if (!WORK_TOOLS.has(e.tool)) {
+      const ran = await next(e)
+      await noteLaunch($, e.tool, ran.result)
+
+      return ran
+    }
+    const bars = await read($, plans)
+    const hasLivePlan = isPlanTouched || bars.some(isOpenPlan)
+    if (!hasLivePlan && !bars.some(p => p.state === 'needs_input') && !hasRefused && workCalls >= WORK_BEFORE_PLAN) {
       hasRefused = true
 
       return { deny: `plan-progress: several changes ahead. Create a bar with ${TOOL} first, then retry.` }
     }
     const ran = await next(e)
+    await noteLaunch($, e.tool, ran.result)
     // a shell call that only read (ls, git status, grep) is not work
     if (ran.deny !== undefined || ran.isReadOnly) return ran
     workCalls += 1
@@ -1002,6 +1025,9 @@ export const register: Register = on => {
       agentHome.delete(agentId)
       waiting.delete(agentId)
     }
+    if (agentId && (await read($, backgroundTaskIds)).includes(agentId)) {
+      await update($, backgroundTaskIds, ids => ids.filter(id => id !== agentId))
+    }
     // a plan whose steps are all finished closes itself
     for (const p of await read($, plans)) {
       if (p.id === AGENTS) continue
@@ -1009,7 +1035,7 @@ export const register: Register = on => {
       const steps = p.stages.flatMap(s => s.steps)
       if (steps.length > 0 && steps.every(s => isFinished(s.status))) await putPlan($, { ...p, state: 'done' })
     }
-    if (!agentId && e.reason === 'answer' && !hasSentBack && !isWaitingOnBackground && agentHome.size === 0) {
+    if (!agentId && e.reason === 'answer' && !hasSentBack && agentHome.size === 0 && (await read($, backgroundTaskIds)).length === 0) {
       hasSentBack = await sendBackOpenBars($, e.answer, workCalls > 0 || isPlanTouched)
     }
 

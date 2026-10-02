@@ -38,6 +38,7 @@ declare module 'claude-code' {
       tick: number
       isRestoreChecked: boolean
       isExpanded: boolean
+      backgroundTaskIds: string[]
     }
   }
 }

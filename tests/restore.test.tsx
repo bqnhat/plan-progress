@@ -69,7 +69,7 @@ describe('bars after a rewind or resume', () => {
     expect(isRefused(ghost)).toBe(true)
   })
 
-  test('a prompt typed after a waiting bar sets it running again, and /progress-clear drops the bars before it', async ($, on) => {
+  test('a prompt typed after a waiting bar leaves it waiting, and /progress-clear drops the bars before it', async ($, on) => {
     world(on, [
       called(barCall({ ...TASK, id: 'old', title: 'Old' })),
       ...ran('progress-clear'),
@@ -79,7 +79,7 @@ describe('bars after a rewind or resume', () => {
     await start($)
 
     const ui = await $.ui.mount({ plugin: 'plan-progress', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-    expect(await ui.find({ type: 'Text', text: '?' })).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: '?' })).toBeDefined()
     await ui.unmount()
     expect((await advance($, 'task')).result).toContain('task: 1/2, running')
     expect(isRefused(await advance($, 'old'))).toBe(true)

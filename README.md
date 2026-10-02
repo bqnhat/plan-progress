@@ -11,9 +11,9 @@ In some sessions the built-in `cc-plugin-sec-default` plugin seats itself outerm
 ## Changes
 
 - **Rules:** they ride the session's first prompt as `prompt.submit` context, whatever its origin. They are sent again after a compaction of the main conversation (not a precompute, a skipped one or a subagent's) and after `/clear`. In the transcript they appear as a `hook_additional_context` attachment.
-- **End-of-turn reminder:** it moved from `classic.Stop` to `turn.complete`. A turn that did work and left a bar running is sent back once with `$.prompt.submit`: a visible plugin message that starts a new turn, at most once per prompt of yours. An answer that ends in a question marks the bar as waiting instead. Subagent and interrupted turns are never sent back.
+- **End-of-turn reminder:** it moved from `classic.Stop` to `turn.complete`. A turn that did work and left a bar running is sent back once with `$.prompt.submit`: a visible plugin message that starts a new turn, at most once per prompt of yours. An answer that ends in a question marks the bar as waiting instead. Subagent and interrupted turns are never sent back, and neither is a turn that ends while background work runs: a background shell, workflow, monitor or agent counts from its launch until its task notification says it ended, the job `classic.Stop`'s `background_tasks` did upstream. A waiting bar stays waiting until Claude moves it on, so a prompt of yours about something else never gets it sent back.
 - **Vietnamese text:** names and labels containing Vietnamese letters are drawn in the system font. Desktop's Anthropic Sans lacks most precomposed Vietnamese letters, so "Viết" rendered as "Viế t".
-- **Rewind and resume:** both start a new process, whose plugin state is empty, so the bars vanished. Once per process the bars are rebuilt from the transcript's `plan_progress` calls (`$.session.messages()`), as they stood at the rewind point. Refused calls are skipped, a prompt you typed sets a waiting bar running again, and a `/progress-clear` in the transcript is honoured.
+- **Rewind and resume:** both start a new process, whose plugin state is empty, so the bars vanished. Once per process the bars are rebuilt from the transcript's `plan_progress` calls (`$.session.messages()`), as they stood at the rewind point. Refused calls are skipped and a `/progress-clear` in the transcript is honoured.
 - **Closing a bar:** the ✕ on a bar hides it instead of deleting it, and it stays hidden while Claude moves it on. The Progress button in the footer and `/progress` show every hidden bar again. Upstream deleted the bar, so the Progress button found nothing to show and only toasted "plan-progress is on".
 - **Compact band:** the band draws one row, the bar Claude touched last, an open bar before a finished one. `+N` after its title opens every bar with its agent strips, `▾` opens the strips of a lone bar, and `▴` folds them again; folded, the knob still counts the agents. A finished bar hides when the next turn starts, and the Progress button and `/progress` show it again. Upstream draws every bar, finished ones included, each with its strips.
 
@@ -51,7 +51,7 @@ For one terminal session only, without installing: `claude --plugin-dir <clone o
 claude plugin test .
 ```
 
-48 tests in `tests/`: the rules delivery, the send-back, the Vietnamese font switch, the rebuild after a rewind, closing a bar and the compact band.
+53 tests in `tests/`: the rules delivery, the send-back, the Vietnamese font switch, the rebuild after a rewind, closing a bar and the compact band.
 
 ## License
 
