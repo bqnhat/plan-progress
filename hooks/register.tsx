@@ -11,6 +11,7 @@ const FIGURE_SPACE = String.fromCharCode(0x2007)
 const isOpen = atom({ plugin: 'plan-progress', key: 'isOpen' } as const, true)
 const tick = atom({ plugin: 'plan-progress', key: 'tick' } as const, 0)
 const isRestoreChecked = atom({ plugin: 'plan-progress', key: 'isRestoreChecked' } as const, false)
+const isExpanded = atom({ plugin: 'plan-progress', key: 'isExpanded' } as const, false)
 const STRIP_H = 18
 const STRIP_GAP = 3
 const MAX_STRIPS = 4 // past this, the finished ones fold into one "+N more" strip
@@ -90,8 +91,19 @@ function normalize(input: Raw, prev: Plan | null, now: number, id: string): Plan
     state,
     note: str(input.note, 160) || null,
     startedAt: prev && prev.title === title ? prev.startedAt : now,
+    updatedAt: now,
     ...(prev?.hidden ? { hidden: true } : {}),
+    ...(prev?.agents ? { agents: prev.agents, agentsDoneAt: prev.agentsDoneAt ?? null } : {}),
   }
+}
+
+const touchedAt = (p: Plan) => p.updatedAt ?? p.startedAt
+const lastTouched = (list: readonly Plan[]) => [...list].sort((a, b) => touchedAt(a) - touchedAt(b)).pop()
+const isDrawn = (p: Plan) => !p.hidden && !p.isFolded
+
+function focusBar(list: readonly Plan[]): Plan | undefined {
+  const open = list.filter(p => p.state !== 'done')
+  return lastTouched(open.length > 0 ? open : list)
 }
 
 const clean = (s: string) =>
@@ -157,6 +169,7 @@ const DEMO = (now: number): Plan => ({
   state: 'running',
   note: null,
   startedAt: now - 260_000,
+  updatedAt: now,
   stages: [
     { name: 'Analysis', steps: [st('Read modules', 'done'), st('Find dependencies', 'done'), st('List changes', 'done')] },
     { name: 'DB migration', steps: [st('Table schema', 'done'), st('Create migration', 'done'), st('Move data', 'active'), st('Indexes', 'pending')] },
@@ -210,8 +223,8 @@ function trackSvg(p: Plan, W: number): string {
   const frac = done ? 1 : Math.min(1, w.pos / Math.max(1, w.total))
   const fx = frac * W
   const key = p.id
-  const from = lastHead.get(key) ?? fx
-  lastHead.set(key, fx)
+  const from = (lastHead.get(key) ?? frac) * W
+  lastHead.set(key, frac)
 
   const acc = hex(STATE_COLOR[p.state])
   const light = mix(acc, [255, 255, 255], 0.32)
@@ -503,7 +516,7 @@ function addRun(p: Plan, run: AgentRun, parentId: string | undefined, now: numbe
     while (at < list.length && (list[at]?.depth ?? 0) > 0) at++
   }
   list.splice(at, 0, run)
-  return syncAuto({ ...p, agents: list, agentsDoneAt: null }, now)
+  return syncAuto({ ...p, agents: list, agentsDoneAt: null, updatedAt: now }, now)
 }
 
 // changes one agent's strip inside the latest list; sounds follow the bar's state
@@ -532,12 +545,25 @@ async function hidePlan($: EngineInterface, id: string) {
   await update($, plans, list => list.map(p => (p.id === id ? { ...p, hidden: true } : p)))
 }
 
-async function toggleBars($: EngineInterface): Promise<boolean> {
-  const isShown = (await read($, isOpen)) && (await read($, plans)).some(p => !p.hidden)
-  await update($, plans, list => list.map(p => (p.hidden ? { ...p, hidden: false } : p)))
-  await update($, isOpen, () => !isShown)
+async function foldFinished($: EngineInterface) {
+  if (!(await read($, plans)).some(p => p.state === 'done' && !p.isFolded)) return
+  await update($, plans, list => list.map(p => (p.state === 'done' && !p.isFolded ? { ...p, isFolded: true } : p)))
+}
 
-  return !isShown
+async function toggleBars($: EngineInterface): Promise<boolean> {
+  const list = await read($, plans)
+  if ((await read($, isOpen)) && list.every(isDrawn)) {
+    await update($, isOpen, () => false)
+
+    return false
+  }
+  if (!list.every(isDrawn)) {
+    await update($, plans, all => all.map(p => (isDrawn(p) ? p : { ...p, hidden: false, isFolded: false })))
+    await update($, isExpanded, () => true)
+  }
+  await update($, isOpen, () => true)
+
+  return true
 }
 
 const STEP_SCHEMA = {
@@ -564,7 +590,7 @@ async function sendBackOpenBars($: EngineInterface, answer: string, didWork: boo
   const open = (await read($, plans)).filter(isOpenPlan)
   if (open.length === 0) return false
   if (/\?\s*$/.test(answer)) {
-    const last = open[open.length - 1]
+    const last = lastTouched(open)
     if (last) await putPlan($, { ...last, state: 'needs_input' })
 
     return false
@@ -590,15 +616,18 @@ async function replayBars($: EngineInterface): Promise<boolean> {
   const messages = (await $.session.messages().catch(() => undefined)) ?? []
   if (messages.length === 0) return false
   const now = await $.clock.now()
+  const barCalls = messages.flatMap(m => m.toolUses).filter(use => use.tool === TOOL).length
+  let callIndex = 0
   let replayed: Plan[] = []
   for (const message of messages) {
     const isPersonTyping = message.role === 'user' && message.text.trim() !== '' && (message.toolResults ?? []).length === 0
     if (isPersonTyping && CLEAR_COMMAND.test(message.text)) replayed = []
     else if (isPersonTyping) replayed = replayed.map(p => (p.state === 'needs_input' ? { ...p, state: 'running', note: null } : p))
     for (const use of message.toolUses) {
+      if (use.tool === TOOL) callIndex += 1
       if (use.tool !== TOOL || use.isError === true || use.text === undefined) continue
       const id = slug(str(use.input.id, 60) || str(use.input.title, 80))
-      const next = normalize(use.input, replayed.find(p => p.id === id) ?? null, now, id)
+      const next = normalize(use.input, replayed.find(p => p.id === id) ?? null, now - barCalls + callIndex, id)
       if (next.stages.length > 0) replayed = placeBar(replayed, next).map(closeFinished)
     }
   }
@@ -623,6 +652,7 @@ export const register: Register = on => {
 
   let isRulesSent = false
   let hasSentBack = false
+  let isPersonPrompt = false
 
   on('turn.start', async ($, e, next) => {
     workCalls = 0
@@ -631,6 +661,8 @@ export const register: Register = on => {
     hasRefused = false
     isWaitingOnBackground = false
     await restoreBarsOnce($)
+    if (isPersonPrompt) await foldFinished($)
+    isPersonPrompt = false
 
     return next(e)
   })
@@ -639,6 +671,7 @@ export const register: Register = on => {
   // and the person answering clears any "needs input" without a model call
   on('prompt.submit', async ($, e, next) => {
     if (e.origin.kind !== 'plugin' || e.origin.name !== 'plan-progress') hasSentBack = false
+    if (e.origin.kind === 'composer' || e.origin.kind === 'bridge') isPersonPrompt = true
     const enter = async (entering: typeof e) => {
       if (isRulesSent) return next(entering)
       const entered = await next({ ...entering, context: [...(entering.context ?? []), RULES] })
@@ -768,7 +801,7 @@ export const register: Register = on => {
   })
 
   on('tool.call', { tool: 'AskUserQuestion' }, async ($, e, next) => {
-    const live = (await read($, plans)).filter(p => p.state === 'running').pop()
+    const live = lastTouched((await read($, plans)).filter(p => p.state === 'running'))
     if (live) await update($, plans, list => list.map(p => (p.id === live.id ? { ...p, state: 'needs_input' as const } : p)))
     play($, 'decision')
     const ran = await next(e)
@@ -821,7 +854,7 @@ export const register: Register = on => {
   on('ui.render', { component: 'SessionMode' }, async ($, e, next) => {
     const all = await read($, plans)
     const count = all.length
-    const isShown = (await read($, isOpen)) && all.some(p => !p.hidden)
+    const isShown = (await read($, isOpen)) && all.some(isDrawn)
     const { Box, Button } = $.ui.resolve(e)
     // other mods add their labels to modes beneath us; keep them
     const below = await next(e)
@@ -839,26 +872,31 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    const list = (await read($, plans)).filter(p => !p.hidden)
-    if (list.length === 0 || e.props.hasSurvey || !(await read($, isOpen))) return next(e)
+    const shown = (await read($, plans)).filter(isDrawn)
+    if (shown.length === 0 || e.props.hasSurvey || !(await read($, isOpen))) return next(e)
     const t = $.ui.resolve(e)
     const { Box, Button, Text } = t
     const Svg = 'Svg' in t ? t.Svg : null
+    await read($, tick)
+    const now = await $.clock.now()
+    const isWide = await read($, isExpanded)
+    const focus = focusBar(shown)
+    const list = isWide || !focus ? shown : [focus]
+    const canExpand = shown.length > 1 || (e.surface === 'desktop' && shown.some(p => visibleAgents(p, now) !== null))
+    const expandLabel = isWide ? '▴' : shown.length > 1 ? `+${shown.length - 1}` : '▾'
     const total = Math.max(320, (e.props.bodyColumns || 100) * 8)
     // every bar has the same width and is pinned to the right edge (fixed-width percent, close button),
     // so rows line up whatever their titles; the slack goes into the gap after the title.
     // Desktop reports ~8 CSS px per column; glyph, gaps, percent and the close button take ~126 px.
     const titleWidth = Math.min(Math.round(total * 0.3), Math.max(...list.map(p => Math.round(textWidth(p.title, 6.4)))))
-    const trackW = Math.max(120, Math.min(1400, total - titleWidth - 140))
-    await read($, tick)
-    const now = await $.clock.now()
+    const trackW = Math.max(120, Math.min(1400, total - titleWidth - 140 - (canExpand ? 28 : 0)))
     // a hairline between task bars, so each bar and its agent strips read as one group
     const divider = `<svg xmlns="http://www.w3.org/2000/svg" width="${total}" height="1"><rect width="${total}" height="1" fill="#808080" fill-opacity=".22"/></svg>`
 
     return (
       <Box flexDirection="column" gap={1}>
         {list.flatMap((p, i) => {
-          const v = visibleAgents(p, now)
+          const v = isWide ? visibleAgents(p, now) : null
           const stripsH = v ? 5 + stripsHeight(v.shown.length + (v.hidden.length > 0 ? 1 : 0)) : 0
           const source = v
             ? `<svg xmlns="http://www.w3.org/2000/svg" width="${trackW}" height="${TRACK_H + stripsH}">${trackSvg(p, trackW)}<g transform="translate(0 ${TRACK_H + 5})">${stripsSvg(v, trackW, now)}</g></svg>`
@@ -880,6 +918,7 @@ export const register: Register = on => {
             <Box key={`bar-${p.id}`} flexDirection="row" alignItems={v ? 'flex-start' : 'center'} gap={1}>
               <Text color={color}>{STATE_GLYPH[p.state]}</Text>
               <Text wrap="truncate">{p.title}</Text>
+              {i === 0 && canExpand ? [<Button key="progress-expand" plain dimColor label={expandLabel} onPress={() => update($, isExpanded, wide => !wide)} />] : []}
               <Box flexGrow={1} />
               {Svg ? (
                 <Svg source={source} alt={alt} width={trackW} height={TRACK_H + stripsH} />
@@ -918,7 +957,13 @@ export const register: Register = on => {
     }
     let isNew = false
     await update($, plans, list => {
-      if (list.some(p => p.id === home)) return list.map(p => (p.id === home ? addRun(p, run, e.parentAgentId, now) : p))
+      if (list.some(p => p.id === home)) {
+        return list.map(p => {
+          if (p.id !== home) return p
+          const added = { ...addRun(p, run, e.parentAgentId, now), isFolded: false }
+          return p.id === AGENTS && typeof p.agentsDoneAt === 'number' ? { ...added, hidden: false } : added
+        })
+      }
       isNew = true
       const auto: Plan = { id: AGENTS, title: 'Agents', kind: 'todo', stages: [], state: 'running', note: null, startedAt: now }
       return placeBar(list, addRun(auto, run, undefined, now))

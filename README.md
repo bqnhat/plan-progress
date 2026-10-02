@@ -15,6 +15,7 @@ In some sessions the built-in `cc-plugin-sec-default` plugin seats itself outerm
 - **Vietnamese text:** names and labels containing Vietnamese letters are drawn in the system font. Desktop's Anthropic Sans lacks most precomposed Vietnamese letters, so "Viết" rendered as "Viế t".
 - **Rewind and resume:** both start a new process, whose plugin state is empty, so the bars vanished. Once per process the bars are rebuilt from the transcript's `plan_progress` calls (`$.session.messages()`), as they stood at the rewind point. Refused calls are skipped, a prompt you typed sets a waiting bar running again, and a `/progress-clear` in the transcript is honoured.
 - **Closing a bar:** the ✕ on a bar hides it instead of deleting it, and it stays hidden while Claude moves it on. The Progress button in the footer and `/progress` show every hidden bar again. Upstream deleted the bar, so the Progress button found nothing to show and only toasted "plan-progress is on".
+- **Compact band:** the band draws one row, the bar Claude touched last, an open bar before a finished one. `+N` after its title opens every bar with its agent strips, `▾` opens the strips of a lone bar, and `▴` folds them again; folded, the knob still counts the agents. A finished bar hides when the next turn starts, and the Progress button and `/progress` show it again. Upstream draws every bar, finished ones included, each with its strips.
 
 ## Requirements
 
@@ -50,7 +51,7 @@ For one terminal session only, without installing: `claude --plugin-dir <clone o
 claude plugin test .
 ```
 
-24 tests in `tests/`: the rules delivery, the send-back, the Vietnamese font switch, the rebuild after a rewind and closing a bar.
+48 tests in `tests/`: the rules delivery, the send-back, the Vietnamese font switch, the rebuild after a rewind, closing a bar and the compact band.
 
 ## License
 

@@ -21,10 +21,12 @@ export type Plan = {
   state: PlanState
   note: string | null
   startedAt: number
+  updatedAt?: number
   agents?: AgentRun[]
   // when the current batch of agents all finished; their strips fold a few seconds later
   agentsDoneAt?: number | null
   hidden?: boolean
+  isFolded?: boolean
 }
 
 declare module 'claude-code' {
@@ -35,6 +37,7 @@ declare module 'claude-code' {
       // bumped every second while agents run, so elapsed times and folding redraw
       tick: number
       isRestoreChecked: boolean
+      isExpanded: boolean
     }
   }
 }

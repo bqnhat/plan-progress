@@ -1,7 +1,7 @@
 {
   "name": "plan-progress",
-  "version": "0.3.0-local.5",
-  "description": "Live plan progress bars above the Claude Code prompt: stages, steps, a pixel fill and soft sounds for decision, error and done. Fork of zycck/claude-mods plan-progress 0.3.0 (ea2c96b) that sends its rules with the first prompt instead of prompt.compose and sends an unexplained open bar back from turn.complete instead of classic.Stop, and redraws the bars from the transcript after a rewind or resume",
+  "version": "0.3.0-local.7",
+  "description": "Live plan progress bars above the Claude Code prompt: stages, steps, a pixel fill and soft sounds for decision, error and done. Fork of zycck/claude-mods plan-progress 0.3.0 (ea2c96b) that sends its rules with the first prompt instead of prompt.compose and sends an unexplained open bar back from turn.complete instead of classic.Stop, redraws the bars from the transcript after a rewind or resume, and folds the band to one row",
   "author": { "name": "Kirill Serditov", "url": "https://github.com/zycck" },
   "license": "MIT",
   "types": "./types/index.d.ts"

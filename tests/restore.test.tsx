@@ -120,4 +120,17 @@ describe('bars after a rewind or resume', () => {
 
     expect((await advance($, 'task')).result).toContain('task: 1/2, running')
   })
+
+  test('the rebuilt band shows the bar the transcript touched last, not the last one in the list', async ($, on) => {
+    world(on, [
+      called(barCall({ ...TASK, id: 'first', title: 'First' })),
+      called(barCall({ ...TASK, id: 'second', title: 'Second' })),
+      called(barCall({ id: 'first', next: true })),
+    ])
+    await start($)
+
+    const ui = await $.ui.mount({ plugin: 'plan-progress', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+    expect(await ui.find({ type: 'Button', key: 'close-first' })).toBeDefined()
+    expect(await ui.find({ type: 'Button', key: 'close-second' })).toBeUndefined()
+  })
 })
