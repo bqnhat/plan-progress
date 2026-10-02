@@ -90,6 +90,7 @@ function normalize(input: Raw, prev: Plan | null, now: number, id: string): Plan
     state,
     note: str(input.note, 160) || null,
     startedAt: prev && prev.title === title ? prev.startedAt : now,
+    ...(prev?.hidden ? { hidden: true } : {}),
   }
 }
 
@@ -527,10 +528,16 @@ async function editAgent($: EngineInterface, agentId: string, change: (a: AgentR
   if (before !== undefined && after !== undefined) chime($, before, after)
 }
 
-async function dropPlan($: EngineInterface, id: string) {
-  lastHead.delete(id)
-  for (const p of await read($, plans)) if (p.id === id) for (const a of p.agents ?? []) lastStrip.delete(a.id)
-  await update($, plans, list => list.filter(p => p.id !== id))
+async function hidePlan($: EngineInterface, id: string) {
+  await update($, plans, list => list.map(p => (p.id === id ? { ...p, hidden: true } : p)))
+}
+
+async function toggleBars($: EngineInterface): Promise<boolean> {
+  const isShown = (await read($, isOpen)) && (await read($, plans)).some(p => !p.hidden)
+  await update($, plans, list => list.map(p => (p.hidden ? { ...p, hidden: false } : p)))
+  await update($, isOpen, () => !isShown)
+
+  return !isShown
 }
 
 const STEP_SCHEMA = {
@@ -784,10 +791,9 @@ export const register: Register = on => {
 
   on('command.run', { command: 'progress' }, async $ => {
     if ((await read($, plans)).length === 0) return { text: 'No plan yet. /progress-demo shows a sample.' }
-    const open = await read($, isOpen)
-    await update($, isOpen, () => !open)
+    const isShown = await toggleBars($)
 
-    return { text: open ? 'Progress bars hidden.' : 'Progress bars shown.' }
+    return { text: isShown ? 'Progress bars shown.' : 'Progress bars hidden.' }
   })
 
   on('command.run', { command: 'progress-demo' }, async $ => {
@@ -813,26 +819,27 @@ export const register: Register = on => {
 
   // always drawn, so the person sees the mod is loaded; dim while there is nothing to show
   on('ui.render', { component: 'SessionMode' }, async ($, e, next) => {
-    const count = (await read($, plans)).length
-    const open = await read($, isOpen)
+    const all = await read($, plans)
+    const count = all.length
+    const isShown = (await read($, isOpen)) && all.some(p => !p.hidden)
     const { Box, Button } = $.ui.resolve(e)
     // other mods add their labels to modes beneath us; keep them
     const below = await next(e)
     const press = () =>
       count === 0
         ? $.ui.toast('plan-progress is on. A bar appears when Claude starts a task with several steps.')
-        : update($, isOpen, () => !open)
+        : toggleBars($)
 
     return (
       <Box flexDirection="row" alignItems="center" gap={1}>
-        <Button key="progress-toggle" dimColor={count === 0 || !open} label={count > 1 ? `Progress ${count}` : 'Progress'} onPress={press} />
+        <Button key="progress-toggle" dimColor={!isShown} label={count > 1 ? `Progress ${count}` : 'Progress'} onPress={press} />
         {below}
       </Box>
     )
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    const list = await read($, plans)
+    const list = (await read($, plans)).filter(p => !p.hidden)
     if (list.length === 0 || e.props.hasSurvey || !(await read($, isOpen))) return next(e)
     const t = $.ui.resolve(e)
     const { Box, Button, Text } = t
@@ -884,7 +891,7 @@ export const register: Register = on => {
                 </Text>
               )}
               <Text dimColor>{`${String(pct).padStart(3, FIGURE_SPACE)}%`}</Text>
-              <Button key={`close-${p.id}`} plain dimColor label="✕" onPress={() => dropPlan($, p.id)} />
+              <Button key={`close-${p.id}`} plain dimColor label="✕" onPress={() => hidePlan($, p.id)} />
             </Box>,
           ]
         })}

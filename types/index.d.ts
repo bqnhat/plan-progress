@@ -24,6 +24,7 @@ export type Plan = {
   agents?: AgentRun[]
   // when the current batch of agents all finished; their strips fold a few seconds later
   agentsDoneAt?: number | null
+  hidden?: boolean
 }
 
 declare module 'claude-code' {

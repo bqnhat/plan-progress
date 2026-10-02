@@ -2,7 +2,7 @@
 
 Live plan progress bars above the Claude Code prompt: stages, steps, a pixel fill and soft sounds for decision, error and done. The model creates a bar with `mcp__plan-progress__plan_progress` and moves it along as it works. Subagents show as state strips under the bar they were started from.
 
-A fork of [`plan-progress`](https://github.com/zycck/claude-mods/tree/ea2c96b7372b01d2d3d061597f319d531942a27c/plugins/plan-progress) 0.3.0 from zycck/claude-mods (commit `ea2c96b7372b01d2d3d061597f319d531942a27c`, MIT, by Kirill Serditov). The first commit of this repository is that upstream copy unchanged; the second holds every change. The plugin keeps its name, so the tool is still `mcp__plan-progress__plan_progress`: never enable this fork and the original together.
+A fork of [`plan-progress`](https://github.com/zycck/claude-mods/tree/ea2c96b7372b01d2d3d061597f319d531942a27c/plugins/plan-progress) 0.3.0 from zycck/claude-mods (commit `ea2c96b7372b01d2d3d061597f319d531942a27c`, MIT, by Kirill Serditov). The first commit of this repository is that upstream copy unchanged; the commits after it hold every change. The plugin keeps its name, so the tool is still `mcp__plan-progress__plan_progress`: never enable this fork and the original together.
 
 ## Why a fork
 
@@ -14,6 +14,7 @@ In some sessions the built-in `cc-plugin-sec-default` plugin seats itself outerm
 - **End-of-turn reminder:** it moved from `classic.Stop` to `turn.complete`. A turn that did work and left a bar running is sent back once with `$.prompt.submit`: a visible plugin message that starts a new turn, at most once per prompt of yours. An answer that ends in a question marks the bar as waiting instead. Subagent and interrupted turns are never sent back.
 - **Vietnamese text:** names and labels containing Vietnamese letters are drawn in the system font. Desktop's Anthropic Sans lacks most precomposed Vietnamese letters, so "Viết" rendered as "Viế t".
 - **Rewind and resume:** both start a new process, whose plugin state is empty, so the bars vanished. Once per process the bars are rebuilt from the transcript's `plan_progress` calls (`$.session.messages()`), as they stood at the rewind point. Refused calls are skipped, a prompt you typed sets a waiting bar running again, and a `/progress-clear` in the transcript is honoured.
+- **Closing a bar:** the ✕ on a bar hides it instead of deleting it, and it stays hidden while Claude moves it on. The Progress button in the footer and `/progress` show every hidden bar again. Upstream deleted the bar, so the Progress button found nothing to show and only toasted "plan-progress is on".
 
 ## Requirements
 
@@ -38,7 +39,7 @@ For one terminal session only, without installing: `claude --plugin-dir <clone o
 
 | Command | What it does |
 | --- | --- |
-| `/progress` | Show or hide the bars |
+| `/progress` | Show or hide the bars; bars hidden with ✕ are shown again |
 | `/progress-demo` | Show a sample plan |
 | `/progress-clear` | Remove all bars |
 | `/progress-sounds` | Play the decision, error and done sounds |
@@ -49,8 +50,8 @@ For one terminal session only, without installing: `claude --plugin-dir <clone o
 claude plugin test .
 ```
 
-21 tests in `tests/`: the rules delivery, the send-back, the Vietnamese font switch and the rebuild after a rewind.
+24 tests in `tests/`: the rules delivery, the send-back, the Vietnamese font switch, the rebuild after a rewind and closing a bar.
 
 ## License
 
-MIT, Copyright (c) 2026 Kirill Serditov (`LICENSE`, copied unchanged). The changes are in the second commit.
+MIT, Copyright (c) 2026 Kirill Serditov (`LICENSE`, copied unchanged). The changes are in the commits after the first.
