@@ -1,0 +1,16 @@
+{
+  "name": "plan-progress",
+  "owner": {
+    "name": "bqnhat"
+  },
+  "metadata": {
+    "description": "plan-progress (zycck/claude-mods) for sessions where cc-plugin-sec-default skips user-tier prompt.compose and classic hooks"
+  },
+  "plugins": [
+    {
+      "name": "plan-progress",
+      "source": "./",
+      "description": "Live plan progress bars above the Claude Code prompt, with the rules sent through prompt.submit and the bars rebuilt after a rewind or resume"
+    }
+  ]
+}

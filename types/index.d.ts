@@ -33,6 +33,7 @@ declare module 'claude-code' {
       isOpen: boolean
       // bumped every second while agents run, so elapsed times and folding redraw
       tick: number
+      isRestoreChecked: boolean
     }
   }
 }

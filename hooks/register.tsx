@@ -10,6 +10,7 @@ const MAX_BARS = 3
 const FIGURE_SPACE = String.fromCharCode(0x2007)
 const isOpen = atom({ plugin: 'plan-progress', key: 'isOpen' } as const, true)
 const tick = atom({ plugin: 'plan-progress', key: 'tick' } as const, 0)
+const isRestoreChecked = atom({ plugin: 'plan-progress', key: 'isRestoreChecked' } as const, false)
 const STRIP_H = 18
 const STRIP_GAP = 3
 const MAX_STRIPS = 4 // past this, the finished ones fold into one "+N more" strip
@@ -181,6 +182,9 @@ function where(p: Plan): Where {
 const hex = (h: string) => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16))
 const mix = (a: number[], b: number[], m: number) => a.map((v, i) => Math.round(v + ((b[i] ?? 0) - v) * m))
 const rgb = (c: number[]) => `rgb(${c.join(',')})`
+const SYSTEM_FONT = "ui-sans-serif,system-ui,-apple-system,'Segoe UI',sans-serif"
+const VIETNAMESE_LETTERS = /[\u01A0\u01A1\u01AF\u01B0\u1EA0-\u1EF9]/
+const fontClass = (s: string) => (VIETNAMESE_LETTERS.test(s) ? ' sf' : '')
 const esc = (s: string) => s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c] ?? c)
 const hash = (a: number, b: number, k: number) => {
   const x = Math.sin(a * 127.1 + b * 311.7 + k * 74.7) * 43758.5453
@@ -287,7 +291,7 @@ function trackSvg(p: Plan, W: number): string {
     const left = -kw / 2 + 10
     knob = `<rect x="${-kw / 2}" y="0" width="${kw}" height="${H}" rx="${H / 2}" fill="${color}"/>`
     if (icon) knob += `<path d="${icon}" transform="translate(${left} 5) scale(.5)" fill="none" stroke="#fff" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"/>`
-    knob += `<text x="${left + iconW}" y="${H / 2 + 4.2}" class="kt">${esc(shown)}<tspan class="kc" dx="6">${count}</tspan></text>`
+    knob += `<text x="${left + iconW}" y="${H / 2 + 4.2}" class="kt${fontClass(shown)}">${esc(shown)}<tspan class="kc" dx="6">${count}</tspan></text>`
   }
   const clampX = (x: number) => Math.max(kw / 2, Math.min(W - kw / 2, x))
   const kx = clampX(fx)
@@ -301,8 +305,9 @@ rect[class]{width:2px;height:2px}
 .t0,.t1,.t2,.t3{animation:tw ${done ? 3.2 : 2.2}s ease-in-out infinite}
 .t1{animation-duration:${done ? 3.8 : 2.8}s;animation-delay:-.7s}.t2{animation-duration:${done ? 4.4 : 1.9}s;animation-delay:-1.3s}.t3{animation-duration:${done ? 3.5 : 3.3}s;animation-delay:-.4s}
 @keyframes tw{0%,100%{opacity:1}50%{opacity:${done ? 0.8 : 0.45}}}
-.kt{font:500 12px 'Anthropic Sans',ui-sans-serif,system-ui,-apple-system,'Segoe UI',sans-serif;fill:#fff}
+.kt{font:500 12px 'Anthropic Sans',${SYSTEM_FONT};fill:#fff}
 .kc{font-weight:400;fill-opacity:.75}
+.sf{font-family:${SYSTEM_FONT}}
 @media (prefers-reduced-motion:reduce){.t0,.t1,.t2,.t3{animation:none}}
 </style>`
   const glideFill = glide ? `<animate attributeName="width" from="${from.toFixed(1)}" to="${fx.toFixed(1)}" dur=".45s" ${ease} fill="freeze"/>` : ''
@@ -386,7 +391,7 @@ function stripsSvg(v: { shown: AgentRun[]; hidden: AgentRun[] }, W: number, now:
     rows.push(
       `<rect x="0" y="${y}" width="${W}" height="${STRIP_H}" rx="${STRIP_H / 2}" fill="${c}" fill-opacity=".15">${flow('fill')}</rect>${px}` +
         `<circle cx="${10 + indent}" cy="${y + STRIP_H / 2}" r="3" fill="${c}"${a.state === 'running' ? ' class="sd"' : ''}>${flow('fill')}</circle>` +
-        `<text x="${nameX}" y="${y + 12.5}" class="sn">${esc(name)}</text>` +
+        `<text x="${nameX}" y="${y + 12.5}" class="sn${fontClass(name)}">${esc(name)}</text>` +
         tool,
     )
   })
@@ -398,7 +403,7 @@ function stripsSvg(v: { shown: AgentRun[]; hidden: AgentRun[] }, W: number, now:
         `<text x="10" y="${y + 12.5}" class="sn st">+${plural(v.hidden.length, 'more agent')} · ${doneCount} done</text>`,
     )
   }
-  return `<style>.sn{font:400 11.5px 'Anthropic Sans',ui-sans-serif,system-ui,-apple-system,'Segoe UI',sans-serif;fill:#F0EEFC}.st{fill-opacity:.65}
+  return `<style>.sn{font:400 11.5px 'Anthropic Sans',${SYSTEM_FONT};fill:#F0EEFC}.st{fill-opacity:.65}.sf{font-family:${SYSTEM_FONT}}
 .sd{animation:sp 1.1s ease-in-out infinite}@keyframes sp{50%{opacity:.3}}
 .mi{animation:mi ${MORPH} ease-out both}@keyframes mi{from{opacity:0;filter:blur(3px)}}
 .mo{animation:mo ${MORPH} ease-in both}@keyframes mo{to{opacity:0;filter:blur(3px)}}
@@ -546,6 +551,60 @@ const WORK_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'Bash'
 const WORK_BEFORE_PLAN = 3 // the 4th changing call without a plan is refused once
 const CALLS_BEFORE_NUDGE = 6 // working calls without a plan update before a reminder
 
+// an open bar at the end of a turn: a question to the user marks it waiting on its own;
+// only a turn that did work and left the bar unexplained is sent back once
+async function sendBackOpenBars($: EngineInterface, answer: string, didWork: boolean): Promise<boolean> {
+  const open = (await read($, plans)).filter(isOpenPlan)
+  if (open.length === 0) return false
+  if (/\?\s*$/.test(answer)) {
+    const last = open[open.length - 1]
+    if (last) await putPlan($, { ...last, state: 'needs_input' })
+
+    return false
+  }
+  if (!didWork) return false
+  void $.prompt
+    .submit({
+      text: `plan-progress: ${open.map(p => p.id).join(', ')} still open. Update each with ${TOOL}: {id, next:true}, or state "done", "needs_input" or "error" with a note.`,
+    })
+    .catch(() => undefined)
+
+  return true
+}
+
+const CLEAR_COMMAND = /(^|<command-name>)\s*\/progress-clear\b/
+
+function closeFinished(p: Plan): Plan {
+  const steps = p.stages.flatMap(s => s.steps)
+  return p.state !== 'done' && steps.length > 0 && steps.every(s => isFinished(s.status)) ? { ...p, state: 'done' } : p
+}
+
+async function replayBars($: EngineInterface): Promise<boolean> {
+  const messages = (await $.session.messages().catch(() => undefined)) ?? []
+  if (messages.length === 0) return false
+  const now = await $.clock.now()
+  let replayed: Plan[] = []
+  for (const message of messages) {
+    const isPersonTyping = message.role === 'user' && message.text.trim() !== '' && (message.toolResults ?? []).length === 0
+    if (isPersonTyping && CLEAR_COMMAND.test(message.text)) replayed = []
+    else if (isPersonTyping) replayed = replayed.map(p => (p.state === 'needs_input' ? { ...p, state: 'running', note: null } : p))
+    for (const use of message.toolUses) {
+      if (use.tool !== TOOL || use.isError === true || use.text === undefined) continue
+      const id = slug(str(use.input.id, 60) || str(use.input.title, 80))
+      const next = normalize(use.input, replayed.find(p => p.id === id) ?? null, now, id)
+      if (next.stages.length > 0) replayed = placeBar(replayed, next).map(closeFinished)
+    }
+  }
+  if (replayed.length > 0) await update($, plans, current => (current.length === 0 ? replayed : current))
+
+  return true
+}
+
+async function restoreBarsOnce($: EngineInterface): Promise<void> {
+  if (await read($, isRestoreChecked)) return
+  const isChecked = (await read($, plans)).length > 0 || (await replayBars($))
+  if (isChecked) await update($, isRestoreChecked, () => true)
+}
 
 export const register: Register = on => {
   // per-turn bookkeeping; module variables are fine here, a reload just starts a fresh count
@@ -555,26 +614,38 @@ export const register: Register = on => {
   let hasRefused = false
   let isWaitingOnBackground = false
 
+  let isRulesSent = false
+  let hasSentBack = false
+
   on('turn.start', async ($, e, next) => {
     workCalls = 0
     sinceUpdate = 0
     isPlanTouched = false
     hasRefused = false
     isWaitingOnBackground = false
+    await restoreBarsOnce($)
 
     return next(e)
   })
 
-  // the rule lives in the cached system prompt; a message only carries one short line when bars are open,
+  // the rules ride the session's first prompt; a message only carries one short line when bars are open,
   // and the person answering clears any "needs input" without a model call
   on('prompt.submit', async ($, e, next) => {
-    if (e.origin.kind !== 'composer') return next(e)
+    if (e.origin.kind !== 'plugin' || e.origin.name !== 'plan-progress') hasSentBack = false
+    const enter = async (entering: typeof e) => {
+      if (isRulesSent) return next(entering)
+      const entered = await next({ ...entering, context: [...(entering.context ?? []), RULES] })
+      if (entered.drop === undefined) isRulesSent = true
+
+      return entered
+    }
+    if (e.origin.kind !== 'composer') return enter(e)
     const list = await read($, plans)
     if (list.some(p => p.state === 'needs_input')) {
       await update($, plans, all => all.map(p => (p.state === 'needs_input' ? { ...p, state: 'running' as const, note: null } : p)))
     }
     const open = list.filter(p => p.state !== 'done' && p.id !== AGENTS)
-    if (open.length === 0) return next(e)
+    if (open.length === 0) return enter(e)
     const line = `plan-progress open bars: ${open
       .map(p => {
         const w = where(p)
@@ -582,7 +653,20 @@ export const register: Register = on => {
       })
       .join(', ')}`
 
-    return next({ ...e, context: [...(e.context ?? []), line] })
+    return enter({ ...e, context: [...(e.context ?? []), line] })
+  })
+
+  on('session.compact', async ($, e, next) => {
+    const result = await next(e)
+    if (e.agentId === undefined && e.trigger !== 'precompute' && result.skip === undefined) isRulesSent = false
+
+    return result
+  })
+
+  on('session.end', async ($, e, next) => {
+    isRulesSent = false
+
+    return next(e)
   })
 
   // watches the main loop's changing calls: refuses once when multi-step work starts without a bar,
@@ -621,28 +705,6 @@ export const register: Register = on => {
     return ran
   })
 
-  // an open bar at the end of a turn: a question to the user marks it waiting on its own;
-  // only a turn that did work and left the bar unexplained is sent back once
-  on('classic.Stop', async ($, e, next) => {
-    const result = await next(e)
-    if (e.stop_hook_active || result.block || isWaitingOnBackground || (e.background_tasks?.length ?? 0) > 0) return result
-    const open = (await read($, plans)).filter(isOpenPlan)
-    if (open.length === 0) return result
-    const asks = /\?\s*$/.test(e.last_assistant_message ?? '')
-    if (asks) {
-      const last = open[open.length - 1]
-      if (last) await putPlan($, { ...last, state: 'needs_input' })
-
-      return result
-    }
-    if (workCalls === 0 && !isPlanTouched) return result
-
-    return {
-      ...result,
-      block: `plan-progress: ${open.map(p => p.id).join(', ')} still open. Update each with ${TOOL}: {id, next:true}, or state "done", "needs_input" or "error" with a note.`,
-    }
-  })
-
   on('session.start', async ($, e, next) => {
     await $.tool.register({
       name: 'plan_progress',
@@ -675,14 +737,10 @@ export const register: Register = on => {
     await $.command.register({ name: 'progress-demo', description: 'Show a sample plan in the progress bars' })
     await $.command.register({ name: 'progress-sounds', description: 'Play the decision, error and done sounds' })
     await $.command.register({ name: 'progress-clear', description: 'Remove all progress bars' })
+    const started = await next(e)
+    await restoreBarsOnce($)
 
-    return next(e)
-  })
-
-  on('prompt.compose', async ($, e, next) => {
-    const result = await next(e)
-
-    return { sections: [...result.sections, { id: 'plan-progress:rules', text: RULES, scope: 'session' as const }] }
+    return started
   })
 
   on('tool.call', { tool: TOOL }, async ($, e) => {
@@ -898,6 +956,9 @@ export const register: Register = on => {
       if (p.state === 'done') continue
       const steps = p.stages.flatMap(s => s.steps)
       if (steps.length > 0 && steps.every(s => isFinished(s.status))) await putPlan($, { ...p, state: 'done' })
+    }
+    if (!agentId && e.reason === 'answer' && !hasSentBack && !isWaitingOnBackground && agentHome.size === 0) {
+      hasSentBack = await sendBackOpenBars($, e.answer, workCalls > 0 || isPlanTouched)
     }
 
     return next(e)
