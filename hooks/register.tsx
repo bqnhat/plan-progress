@@ -1,11 +1,13 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, Register, RenderElement } from 'claude-code'
 
-import type { AgentRun, Plan, PlanStage, PlanState, PlanStep, StepStatus } from '../types'
+import type { AgentRun, Plan, PlanStage, PlanState, PlanStep, PlanSubstep, StepStatus } from '../types'
 
 const TOOL = 'mcp__plan-progress__plan_progress'
 const plans = atom({ plugin: 'plan-progress', key: 'plans' } as const, [])
 const MAX_BARS = 3
+const MAX_KEPT = 30
+const RECENT_DONE = 3
 // a space as wide as a digit, so '  0%' and '100%' take the same room
 const FIGURE_SPACE = String.fromCharCode(0x2007)
 const isOpen = atom({ plugin: 'plan-progress', key: 'isOpen' } as const, true)
@@ -13,16 +15,25 @@ const tick = atom({ plugin: 'plan-progress', key: 'tick' } as const, 0)
 const isRestoreChecked = atom({ plugin: 'plan-progress', key: 'isRestoreChecked' } as const, false)
 const isExpanded = atom({ plugin: 'plan-progress', key: 'isExpanded' } as const, false)
 const backgroundTaskIds = atom({ plugin: 'plan-progress', key: 'backgroundTaskIds' } as const, [])
-const STRIP_H = 18
-const STRIP_GAP = 3
-const MAX_STRIPS = 4 // past this, the finished ones fold into one "+N more" strip
-const FOLD_MS = 5000 // finished strips stay this long, failed ones stay until the bar closes
+const expandedIds = atom({ plugin: 'plan-progress', key: 'expandedIds' } as const, [])
+const isHistoryOpen = atom({ plugin: 'plan-progress', key: 'isHistoryOpen' } as const, false)
+const paneState = atom({ plugin: 'plan-progress', key: 'paneState' } as const, 'down')
+const PANE = 'plan-progress'
+const PANE_TITLE = 'Progress'
+const RING = 22
+const FOLD_MS = 5000
+const LIVE_TICK_MS = 10_000
+const SEG_H = 4
+const SEG_GAP = 2
+const STAGE_GAP = 5
+const DETAIL_INDENT = 5
+const HOVER_BG = '#8080801f'
+const ROW_FILL_CHAR = ' '
+const ROW_FILL_PER_COLUMN = 2.75
 
 const STATE_COLOR: Record<PlanState, string> = { running: '#8B7CF6', needs_input: '#E09A1E', error: '#E5484D', done: '#30A46C' }
 const STATE_GLYPH: Record<PlanState, string> = { running: '●', needs_input: '?', error: '!', done: '✓' }
 const STATUSES: StepStatus[] = ['pending', 'active', 'done', 'error', 'skipped']
-const TRACK_H = 22
-const NARROW = 360
 
 const RULES = `# Progress bars
 Tasks needing more than ~3 edits or commands get a bar via ${TOOL}: create it once with the full breakdown (2-7 stages with short steps, or kind "todo" for one flat list; titles of at most 4 words, in the user's language), then update it with short calls only: {id, next:true} when the active step is finished, or {id, done:[...], active:"..."}, {id, failed:"...", note}. Send state "needs_input" with a note before asking the user to decide. Never describe the bars to the user.`
@@ -65,9 +76,52 @@ function applyOps(stages: PlanStage[], input: Raw): PlanStage[] {
   return next
 }
 
+type Timed = { title: string; status: StepStatus; startedAt?: number; endedAt?: number }
+
+function timed<T extends Timed>(item: T, startedAt: number | undefined, endedAt: number | undefined): T {
+  const bare: T = { ...item }
+  delete bare.startedAt
+  delete bare.endedAt
+
+  return { ...bare, ...(startedAt === undefined ? {} : { startedAt }), ...(endedAt === undefined ? {} : { endedAt }) }
+}
+
+function stamp<T extends Timed>(item: T, was: Timed | undefined, now: number): T {
+  if (item.status === 'pending') return timed(item, undefined, undefined)
+  const startedAt = was?.startedAt ?? item.startedAt ?? (item.status === 'active' ? now : undefined)
+  if (item.status === 'active') return timed(item, startedAt, undefined)
+  const keptEnd = was !== undefined && was.status === item.status ? (was.endedAt ?? item.endedAt) : undefined
+
+  return timed(item, startedAt, keptEnd ?? now)
+}
+
+function matcher<T extends Timed>(pool: readonly T[]): (title: string) => T | undefined {
+  const used = new Set<T>()
+
+  return title => {
+    const found = pool.find(one => !used.has(one) && same(one.title, title))
+    if (found) used.add(found)
+    return found
+  }
+}
+
+function stampStages(stages: PlanStage[], prev: readonly PlanStage[], now: number): PlanStage[] {
+  const matchStep = matcher(prev.flatMap(s => s.steps))
+
+  return stages.map(s => ({
+    ...s,
+    steps: s.steps.map(step => {
+      const was = matchStep(step.title)
+      const matchSub = matcher<PlanSubstep>(was?.substeps ?? [])
+
+      return { ...stamp(step, was, now), substeps: step.substeps.map(sub => stamp(sub, matchSub(sub.title), now)) }
+    }),
+  }))
+}
+
 function normalize(input: Raw, prev: Plan | null, now: number, id: string): Plan {
   const isPartial = list(input.stages).length === 0 && prev !== null
-  const stages: PlanStage[] = isPartial ? applyOps(prev.stages, input) : list(input.stages)
+  const given: PlanStage[] = isPartial ? applyOps(prev.stages, input) : list(input.stages)
     .map(s => ({
       name: str(s.name, 80) || 'Stage',
       steps: list(s.steps).map(st => ({
@@ -77,6 +131,7 @@ function normalize(input: Raw, prev: Plan | null, now: number, id: string): Plan
       })),
     }))
     .filter(s => s.steps.length > 0) as PlanStage[]
+  const stages = stampStages(given, prev?.stages ?? [], now)
   const title = str(input.title, 80) || prev?.title || 'Plan'
   const steps = stages.flatMap(s => s.steps)
   const isAllDone = steps.length > 0 && steps.every(s => isFinished(s.status))
@@ -180,7 +235,7 @@ const DEMO = (now: number): Plan => ({
   ],
 })
 
-// ---------- drawing ----------
+/// ---------- drawing ----------
 
 type Where = { pos: number; total: number; stage: number; step: number; stageSize: number }
 
@@ -194,146 +249,10 @@ function where(p: Plan): Where {
   return { pos, total: steps.length, stage, step: pos >= steps.length ? (p.stages[stage]?.steps.length ?? 0) : (cur?.j ?? 0) + 1, stageSize: p.stages[stage]?.steps.length ?? 0 }
 }
 
-const hex = (h: string) => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16))
-const mix = (a: number[], b: number[], m: number) => a.map((v, i) => Math.round(v + ((b[i] ?? 0) - v) * m))
-const rgb = (c: number[]) => `rgb(${c.join(',')})`
-const SYSTEM_FONT = "ui-sans-serif,system-ui,-apple-system,'Segoe UI',sans-serif"
-const VIETNAMESE_LETTERS = /[\u01A0\u01A1\u01AF\u01B0\u1EA0-\u1EF9]/
-const fontClass = (s: string) => (VIETNAMESE_LETTERS.test(s) ? ' sf' : '')
-const esc = (s: string) => s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c] ?? c)
-const hash = (a: number, b: number, k: number) => {
-  const x = Math.sin(a * 127.1 + b * 311.7 + k * 74.7) * 43758.5453
-  return x - Math.floor(x)
-}
-const textWidth = (s: string, px = 6.7) => [...s].reduce((w, ch) => w + (/[　-鿿]/.test(ch) ? 12 : /[ilI.,:;'|!]/.test(ch) ? 3.4 : /[mwMWШЩЖМ]/.test(ch) ? 9.5 : px), 0)
-
 const ICON_PATH: Partial<Record<PlanState, string>> = {
   needs_input: 'M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3M12 17h.01',
   error: 'M18 6 6 18M6 6l12 12',
   done: 'M20 6 9 17l-5-5',
-}
-
-// last drawn head position per plan, so a redraw glides from where the bar was
-const lastHead = new Map<string, number>()
-
-function trackSvg(p: Plan, W: number): string {
-  const H = TRACK_H
-  const w = where(p)
-  const done = p.state === 'done'
-  // the fill is exactly the finished share: a fresh plan starts empty
-  const frac = done ? 1 : Math.min(1, w.pos / Math.max(1, w.total))
-  const fx = frac * W
-  const key = p.id
-  const from = (lastHead.get(key) ?? frac) * W
-  lastHead.set(key, frac)
-
-  const acc = hex(STATE_COLOR[p.state])
-  const light = mix(acc, [255, 255, 255], 0.32)
-  const grey = [132, 130, 138]
-  const ease = 'calcMode="spline" keyTimes="0;1" keySplines=".2 .8 .2 1"'
-  const glide = Math.abs(from - fx) > 0.5
-
-  const bounds: number[] = []
-  let acc2 = 0
-  p.stages.forEach((s, i) => {
-    acc2 += s.steps.length
-    if (i < p.stages.length - 1) bounds.push((acc2 / w.total) * W)
-  })
-
-  // pixels: 3px grid, 7 rows, denser and closer to the state colour towards the head
-  const buckets = [0, 1, 2, 3, 4].map(b => {
-    const m = b / 4
-    const dense = done ? 0.8 : 0.22 + 0.78 * Math.pow(m, 1.5)
-    return { color: rgb(done ? light : mix(grey, light, m)), opacity: (0.35 + 0.65 * dense).toFixed(2) }
-  })
-  let px = ''
-  for (let col = 0; col * 3 < fx; col++) {
-    const x = col * 3
-    const u = Math.min(1, (x + 1.5) / fx)
-    const dense = done ? 0.8 : 0.22 + 0.78 * Math.pow(u, 1.5)
-    const bucket = done ? 4 : Math.min(4, Math.floor(Math.min(1, Math.pow(u, 0.9) * 1.1) * 4.99))
-    for (let r = 0; r < 7; r++) {
-      if (hash(col, r, 1) > dense + 0.1) continue
-      px += `<rect x="${x}" y="${1 + r * 3}" class="b${bucket} t${Math.floor(hash(col, r, 2) * 4)}"/>`
-    }
-  }
-
-  let marks = ''
-  let k = 0
-  p.stages.forEach((s, i) => {
-    s.steps.forEach((_, j) => {
-      if (k > 0) {
-        const x = (k / w.total) * W
-        const isStage = j === 0
-        // stage boundaries are full-height lines, steps are short ticks; bright once passed
-        const passed = x < fx - 1
-        const h = isStage ? H : 8
-        const fill = passed ? rgb(mix(light, [255, 255, 255], 0.45)) : '#8A8984'
-        const opacity = passed ? (isStage ? 0.95 : 0.6) : isStage ? 0.7 : 0.45
-        marks += `<rect x="${(x - (isStage ? 1 : 0.75)).toFixed(1)}" y="${(H - h) / 2}" width="${isStage ? 2 : 1.5}" height="${h}" rx=".75" fill="${fill}" opacity="${opacity}"/>`
-      }
-      k++
-    })
-    void i
-  })
-
-  // knob: a pill with stage and count, or a round dot with the stage number when narrow
-  const isNarrow = W < NARROW
-  const color = STATE_COLOR[p.state]
-  const icon = ICON_PATH[p.state]
-  const single = p.stages.length === 1
-  const number = single ? Math.min(w.total, w.pos + 1) : w.stage + 1
-  let knob = ''
-  let kw = H
-  if (isNarrow) {
-    const label = done ? '' : String(number)
-    knob = `<circle cx="0" cy="${H / 2}" r="${H / 2}" fill="${color}"/>${
-      done ? `<path d="${ICON_PATH.done}" transform="translate(-6 5) scale(.5)" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>` : `<text x="0" y="${H / 2 + 4.2}" text-anchor="middle" class="kt">${label}</text>`
-    }`
-  } else {
-    const name = done ? 'Done' : single ? (p.stages[0]?.name ?? 'Tasks') : (p.stages[w.stage]?.name ?? '')
-    const agents = p.agents ?? []
-    const base = p.id === AGENTS ? `${w.pos}/${w.total}` : done ? `${w.total}/${w.total}` : single ? `${number}/${w.total}` : `${w.step}/${w.stageSize}`
-    const agentCount = agents.length > 0 && p.id !== AGENTS ? ` · ${agents.filter(a => a.state === 'done').length}/${agents.length} agents` : ''
-    const count = base + agentCount
-    const iconW = icon ? 16 : 0
-    const countW = textWidth(count, 6.5)
-    const maxW = Math.max(80, W * 0.55)
-    let shown = name
-    while (shown.length > 3 && 20 + iconW + textWidth(shown) + 6 + countW > maxW) shown = shown.slice(0, -1)
-    if (shown !== name) shown = shown.trimEnd() + '…'
-    kw = Math.round(20 + iconW + textWidth(shown) + 6 + countW)
-    const left = -kw / 2 + 10
-    knob = `<rect x="${-kw / 2}" y="0" width="${kw}" height="${H}" rx="${H / 2}" fill="${color}"/>`
-    if (icon) knob += `<path d="${icon}" transform="translate(${left} 5) scale(.5)" fill="none" stroke="#fff" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"/>`
-    knob += `<text x="${left + iconW}" y="${H / 2 + 4.2}" class="kt${fontClass(shown)}">${esc(shown)}<tspan class="kc" dx="6">${count}</tspan></text>`
-  }
-  const clampX = (x: number) => Math.max(kw / 2, Math.min(W - kw / 2, x))
-  const kx = clampX(fx)
-  const kFrom = clampX(from)
-
-  const style = `<style>
-.b0{fill:${buckets[0]?.color};fill-opacity:${buckets[0]?.opacity}}.b1{fill:${buckets[1]?.color};fill-opacity:${buckets[1]?.opacity}}
-.b2{fill:${buckets[2]?.color};fill-opacity:${buckets[2]?.opacity}}.b3{fill:${buckets[3]?.color};fill-opacity:${buckets[3]?.opacity}}
-.b4{fill:${buckets[4]?.color};fill-opacity:${buckets[4]?.opacity}}
-rect[class]{width:2px;height:2px}
-.t0,.t1,.t2,.t3{animation:tw ${done ? 3.2 : 2.2}s ease-in-out infinite}
-.t1{animation-duration:${done ? 3.8 : 2.8}s;animation-delay:-.7s}.t2{animation-duration:${done ? 4.4 : 1.9}s;animation-delay:-1.3s}.t3{animation-duration:${done ? 3.5 : 3.3}s;animation-delay:-.4s}
-@keyframes tw{0%,100%{opacity:1}50%{opacity:${done ? 0.8 : 0.45}}}
-.kt{font:500 12px 'Anthropic Sans',${SYSTEM_FONT};fill:#fff}
-.kc{font-weight:400;fill-opacity:.75}
-.sf{font-family:${SYSTEM_FONT}}
-@media (prefers-reduced-motion:reduce){.t0,.t1,.t2,.t3{animation:none}}
-</style>`
-  const glideFill = glide ? `<animate attributeName="width" from="${from.toFixed(1)}" to="${fx.toFixed(1)}" dur=".45s" ${ease} fill="freeze"/>` : ''
-  const glideKnob = glide ? `<animateTransform attributeName="transform" type="translate" from="${kFrom.toFixed(1)} 0" to="${kx.toFixed(1)} 0" dur=".45s" ${ease} fill="freeze"/>` : ''
-
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">${style}
-<defs><clipPath id="pill"><rect width="${W}" height="${H}" rx="${H / 2}"/></clipPath><clipPath id="fill"><rect width="${fx.toFixed(1)}" height="${H}">${glideFill}</rect></clipPath>
-<linearGradient id="base" x1="0" x2="${fx.toFixed(1)}" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="${rgb(acc)}" stop-opacity="${done ? 0.3 : 0.05}"/><stop offset="1" stop-color="${rgb(acc)}" stop-opacity=".33"/></linearGradient></defs>
-<g clip-path="url(#pill)"><rect width="${W}" height="${H}" fill="#808080" fill-opacity=".16"/>
-<g clip-path="url(#fill)"><rect width="${fx.toFixed(1)}" height="${H}" fill="url(#base)"/>${px}</g>${marks}</g>
-<g transform="translate(${kx.toFixed(1)} 0)">${glideKnob}${knob}</g></svg>`
 }
 
 const AGENT_COLOR: Record<AgentRun['state'], string> = {
@@ -342,92 +261,126 @@ const AGENT_COLOR: Record<AgentRun['state'], string> = {
   done: STATE_COLOR.done,
   error: STATE_COLOR.error,
 }
+const AGENT_GLYPH: Record<AgentRun['state'], string> = { running: '●', waiting: '?', done: '✓', error: '!' }
 
 const elapsed = (ms: number) => {
   const sec = Math.max(0, Math.round(ms / 1000))
   return sec < 60 ? `${sec}s` : `${Math.floor(sec / 60)}m ${sec % 60}s`
 }
 
-// which strips show: all of a small batch; in a big one the unfinished first, the rest folded into one line
-function visibleAgents(p: Plan, now: number): { shown: AgentRun[]; hidden: AgentRun[] } | null {
-  const list = p.agents ?? []
-  if (list.length === 0) return null
-  const hasError = list.some(a => a.state === 'error')
-  if (p.agentsDoneAt && now - p.agentsDoneAt > FOLD_MS && !hasError) return null
-  if (list.length <= MAX_STRIPS) return { shown: list, hidden: [] }
-  const keep = new Set(list.filter(a => a.state !== 'done').slice(0, MAX_STRIPS - 1).map(a => a.id))
-  for (const a of [...list].reverse()) {
-    if (keep.size >= MAX_STRIPS - 1) break
-    keep.add(a.id)
-  }
-  return { shown: list.filter(a => keep.has(a.id)), hidden: list.filter(a => !keep.has(a.id)) }
+const span = (ms: number) => {
+  const sec = Math.round(ms / 1000)
+  if (sec < 1) return ''
+  return sec < 3600 ? elapsed(ms) : `${Math.floor(sec / 3600)}h ${Math.floor((sec % 3600) / 60)}m`
 }
 
-// what each strip showed last time it was drawn, so a change morphs from the old status instead of jumping
-const lastStrip = new Map<string, { tool: string; color: string }>()
-const MORPH = '.2s'
+const shortSpan = (ms: number) => {
+  const sec = Math.round(ms / 1000)
+  if (sec < 1) return ''
+  if (sec < 60) return `${sec}s`
+  return sec < 3600 ? `${Math.floor(sec / 60)}m` : `${Math.floor(sec / 3600)}h ${Math.floor((sec % 3600) / 60)}m`
+}
 
-const stripsHeight = (n: number) => n * STRIP_H + (n - 1) * STRIP_GAP
-
-// one tinted strip per agent: state colour, name, what it does now and for how long; not a progress bar
-function stripsSvg(v: { shown: AgentRun[]; hidden: AgentRun[] }, W: number, now: number): string {
-  const isNarrow = W < NARROW
-  const rows: string[] = []
-  v.shown.forEach((a, i) => {
-    const c = AGENT_COLOR[a.state]
-    const y = i * (STRIP_H + STRIP_GAP)
-    const indent = a.depth > 0 ? 12 : 0
-    let px = ''
-    if (a.state === 'running') {
-      for (let col = 0; col * 3 < W; col++) {
-        for (let r = 0; r < 4; r++) {
-          if (hash(col + i * 41, r, 5) > 0.2) continue
-          px += `<rect x="${col * 3}" y="${y + 3 + r * 3.6}" class="t${Math.floor(hash(col, r, 6) * 4)}" fill="${c}" fill-opacity=".32"/>`
-        }
-      }
-    }
-    const nameRoom = isNarrow ? W - 30 - indent : W * 0.5
-    let name = (a.depth > 0 ? '↳ ' : '') + a.title
-    while (name.length > 4 && textWidth(name, 6.2) > nameRoom) name = name.slice(0, -1)
-    if (name !== (a.depth > 0 ? '↳ ' : '') + a.title) name = name.trimEnd() + '…'
-    const nameX = 19 + indent
-    const toolX = nameX + textWidth(name, 6.2) + 8
-    const time = elapsed((a.endedAt ?? now) - a.startedAt)
-    // a status change: the old word blurs out while the new one blurs in, and the tint flows to the new colour
-    const was = lastStrip.get(a.id)
-    lastStrip.set(a.id, { tool: a.tool, color: c })
-    const isToolChanged = was !== undefined && was.tool !== a.tool
-    const flow = (attr: string) => (was && was.color !== c ? `<animate attributeName="${attr}" from="${was.color}" to="${c}" dur="${MORPH}" fill="freeze"/>` : '')
-    const tool = isNarrow
-      ? ''
-      : (isToolChanged ? `<text x="${toolX}" y="${y + 12.5}" class="sn mo" style="fill:${was.color}">${esc(was.tool)}</text>` : '') +
-        `<text x="${toolX}" y="${y + 12.5}" class="sn${isToolChanged ? ' mi' : ''}" style="fill:${c}">${esc(a.tool)}</text>` +
-        `<text x="${W - 9}" y="${y + 12.5}" text-anchor="end" class="sn st">${time}</text>`
-    rows.push(
-      `<rect x="0" y="${y}" width="${W}" height="${STRIP_H}" rx="${STRIP_H / 2}" fill="${c}" fill-opacity=".15">${flow('fill')}</rect>${px}` +
-        `<circle cx="${10 + indent}" cy="${y + STRIP_H / 2}" r="3" fill="${c}"${a.state === 'running' ? ' class="sd"' : ''}>${flow('fill')}</circle>` +
-        `<text x="${nameX}" y="${y + 12.5}" class="sn${fontClass(name)}">${esc(name)}</text>` +
-        tool,
-    )
-  })
-  if (v.hidden.length > 0) {
-    const y = v.shown.length * (STRIP_H + STRIP_GAP)
-    const doneCount = v.hidden.filter(a => a.state === 'done').length
-    rows.push(
-      `<rect x="0" y="${y}" width="${W}" height="${STRIP_H}" rx="${STRIP_H / 2}" fill="#808080" fill-opacity=".14"/>` +
-        `<text x="10" y="${y + 12.5}" class="sn st">+${plural(v.hidden.length, 'more agent')} · ${doneCount} done</text>`,
-    )
-  }
-  return `<style>.sn{font:400 11.5px 'Anthropic Sans',${SYSTEM_FONT};fill:#F0EEFC}.st{fill-opacity:.65}.sf{font-family:${SYSTEM_FONT}}
-.sd{animation:sp 1.1s ease-in-out infinite}@keyframes sp{50%{opacity:.3}}
-.mi{animation:mi ${MORPH} ease-out both}@keyframes mi{from{opacity:0;filter:blur(3px)}}
-.mo{animation:mo ${MORPH} ease-in both}@keyframes mo{to{opacity:0;filter:blur(3px)}}
-@media (prefers-reduced-motion:reduce){.sd,.mi,.mo{animation:none}.mo{opacity:0}}</style>${rows.join('')}`
+const two = (n: number) => String(n).padStart(2, '0')
+const clockTime = (ms: number) => {
+  const d = new Date(ms)
+  return `${two(d.getHours())}:${two(d.getMinutes())}`
 }
 
 function plural(n: number, word: string) {
   return `${n} ${word}${n === 1 ? '' : 's'}`
 }
+
+const percent = (p: Plan, w: Where) => (p.state === 'done' ? 100 : Math.round((Math.min(w.pos, w.total) / Math.max(1, w.total)) * 100))
+
+const endOf = (p: Plan, now: number) => (p.state === 'done' ? touchedAt(p) : now)
+
+function ringSvg(p: Plan, pct: number): string {
+  const r = (RING - 6) / 2
+  const c = 2 * Math.PI * r
+  const color = STATE_COLOR[p.state]
+  const icon = ICON_PATH[p.state]
+  const at = RING / 2 - 5
+  const mark = icon ? `<path d="${icon}" transform="translate(${at} ${at}) scale(.42)" fill="none" stroke="${color}" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"/>` : ''
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${RING}" height="${RING}" viewBox="0 0 ${RING} ${RING}"><circle cx="${RING / 2}" cy="${RING / 2}" r="${r}" fill="none" stroke="#8A8984" stroke-opacity=".3" stroke-width="3"/><circle cx="${RING / 2}" cy="${RING / 2}" r="${r}" fill="none" stroke="${color}" stroke-width="3" stroke-linecap="round" stroke-dasharray="${((pct / 100) * c).toFixed(1)} ${c.toFixed(1)}" transform="rotate(-90 ${RING / 2} ${RING / 2})"/>${mark}</svg>`
+}
+
+const stepColor = (status: StepStatus, live: string) =>
+  status === 'done' ? STATE_COLOR.done : status === 'error' ? STATE_COLOR.error : status === 'active' ? live : '#8A8984'
+
+function stepsSvg(p: Plan, W: number): string {
+  const steps = p.stages.flatMap((s, i) => s.steps.map((step, j) => ({ step, isStageEnd: j === s.steps.length - 1 && i < p.stages.length - 1 })))
+  const stageGaps = steps.filter(one => one.isStageEnd).length
+  const seg = Math.max(1, (W - (steps.length - 1) * SEG_GAP - stageGaps * STAGE_GAP) / Math.max(1, steps.length))
+  let x = 0
+  let rects = ''
+  for (const { step, isStageEnd } of steps) {
+    const opacity = step.status === 'pending' ? 0.3 : step.status === 'skipped' ? 0.55 : 1
+    rects += `<rect x="${x.toFixed(1)}" y="0" width="${seg.toFixed(1)}" height="${SEG_H}" rx="1.5" fill="${stepColor(step.status, STATE_COLOR[p.state])}" fill-opacity="${opacity}"/>`
+    x += seg + SEG_GAP + (isStageEnd ? STAGE_GAP : 0)
+  }
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${SEG_H}" viewBox="0 0 ${W} ${SEG_H}">${rects}</svg>`
+}
+
+type Times = { items: Map<Timed, string>; stages: string[] }
+
+function timesOf(p: Plan, now: number): Times {
+  const items = new Map<Timed, string>()
+  const live = (start: number) => {
+    const took = span(now - start)
+    return took && `${took}…`
+  }
+  let prevEnd = p.startedAt
+  const stages = p.stages.map(s => {
+    const stageStart = s.steps[0]?.startedAt ?? prevEnd
+    for (const step of s.steps) {
+      const start = step.startedAt ?? prevEnd
+      if (step.endedAt !== undefined) {
+        items.set(step, span(step.endedAt - start))
+        prevEnd = step.endedAt
+      } else if (step.status === 'active') items.set(step, live(start))
+      let subEnd = start
+      for (const sub of step.substeps) {
+        const subStart = sub.startedAt ?? subEnd
+        if (sub.endedAt !== undefined) {
+          items.set(sub, span(sub.endedAt - subStart))
+          subEnd = sub.endedAt
+        } else if (sub.status === 'active') items.set(sub, live(subStart))
+      }
+    }
+    const isOver = s.steps.every(step => step.endedAt !== undefined)
+    const isStarted = s.steps.some(step => step.status === 'active' || step.endedAt !== undefined)
+    return isOver ? span(prevEnd - stageStart) : isStarted && p.state !== 'done' ? span(now - stageStart) : ''
+  })
+  return { items, stages }
+}
+
+function overview(p: Plan, w: Where): string {
+  const agents = p.agents ?? []
+  const busy = agents.filter(a => a.state === 'running' || a.state === 'waiting').length
+  if (p.id === AGENTS) return `${agents.filter(a => a.state === 'done').length}/${plural(agents.length, 'agent')} done`
+  const current = p.stages.flatMap(s => s.steps).find(step => step.status === 'active' || step.status === 'error')
+  const head =
+    p.state === 'done'
+      ? `Done at ${clockTime(touchedAt(p))}`
+      : p.state === 'needs_input'
+        ? `Waiting on you${p.note ? ` · ${p.note}` : ''}`
+        : p.state === 'error'
+          ? `Failed${p.note ? ` · ${p.note}` : ''}`
+          : `Step ${Math.min(w.pos + 1, w.total)}/${w.total}${current ? ` · ${current.title}` : ''}`
+
+  return [head, busy > 0 ? plural(busy, 'agent') : ''].filter(part => part !== '').join(' · ')
+}
+
+function agentCounts(agents: readonly AgentRun[]): string {
+  const of = (state: AgentRun['state'], word: string) => {
+    const n = agents.filter(a => a.state === state).length
+    return n > 0 ? `${n} ${word}` : ''
+  }
+  return [of('running', 'running'), of('waiting', 'waiting'), of('done', 'done'), of('error', 'failed')].filter(part => part !== '').join(' · ')
+}
+
+const STEP_GLYPH: Record<StepStatus, string> = { done: '✓', active: '●', pending: '○', error: '!', skipped: '–' }
 
 // ---------- engine glue ----------
 
@@ -452,13 +405,13 @@ const slug = (s: string) =>
     .replace(/^-|-$/g, '')
     .slice(0, 40) || 'plan'
 
-// adds or replaces one bar by id; keeps at most MAX_BARS, dropping finished ones first
+// adds or replaces one bar by id; keeps at most MAX_KEPT, dropping finished ones first
 // computed inside update() from the latest list, so concurrent writers (parallel agents) do not drop each other
 function placeBar(list: readonly Plan[], next: Plan): Plan[] {
   const prev = list.find(p => p.id === next.id)
   // an update keeps its row; a new bar goes to the bottom
   const rest = prev ? list.map(p => (p.id === next.id ? next : p)) : [...list, next]
-  while (rest.length > MAX_BARS) {
+  while (rest.length > MAX_KEPT) {
     const doneAt = rest.findIndex(p => p.state === 'done')
     rest.splice(doneAt >= 0 ? doneAt : 0, 1)
   }
@@ -480,6 +433,54 @@ async function putPlan($: EngineInterface, next: Plan) {
   })
   chime($, prev?.state, next.state)
   if (!prev) await update($, isOpen, () => true)
+  await syncPane($)
+}
+
+const isDesktopSession = async ($: EngineInterface) => (await $.session.surfaces().catch(() => [])).includes('desktop')
+const findPane = async ($: EngineInterface) => (await $.ui.panes().catch(() => [])).find(pane => pane.id === PANE)
+
+let paneSync: Promise<void> = Promise.resolve()
+let pressesPending = 0
+let mayBeUp = true
+const SYNC_LIMIT_MS = 5000
+
+function syncPane($: EngineInterface, isAsked = false): Promise<void> {
+  const run = paneSync.then(() => reconcilePane($, isAsked))
+  const settled = new Promise<void>(resolve => {
+    void run.then(resolve, resolve)
+    $.clock.after(SYNC_LIMIT_MS, () => resolve())
+  })
+  paneSync = settled
+
+  return run
+}
+
+type PaneState = 'down' | 'up' | 'unplaced'
+
+async function setPaneState($: EngineInterface, next: PaneState) {
+  if ((await read($, paneState)) !== next) await update($, paneState, () => next)
+}
+
+async function reconcilePane($: EngineInterface, isAsked: boolean) {
+  const isDesktop = await isDesktopSession($)
+  if (!isDesktop && !mayBeUp) return
+  const pane = await findPane($)
+  mayBeUp = pane !== undefined
+  const isWanted = isDesktop && (await read($, isOpen)) && (await read($, plans)).some(isDrawn)
+  if (isWanted && pane === undefined) {
+    if (pressesPending > 0 && !isAsked) return
+    const opened = await $.ui.open({ id: PANE, title: PANE_TITLE }).catch(() => undefined)
+    mayBeUp = opened !== undefined
+    await setPaneState($, opened === undefined ? 'down' : opened.isPlaced ? 'up' : 'unplaced')
+    return
+  }
+  if (!isWanted && pane !== undefined) {
+    await $.ui.close({ id: PANE }).catch(() => undefined)
+    mayBeUp = false
+    await setPaneState($, 'down')
+    return
+  }
+  await setPaneState($, pane === undefined ? 'down' : pane.isPlaced ? 'up' : 'unplaced')
 }
 
 // ---------- agents: drawn from engine events alone, no model calls ----------
@@ -500,7 +501,13 @@ function syncAuto(p: Plan, now: number): Plan {
   const rank = (a: AgentRun) => (a.state === 'done' ? 0 : a.state === 'error' ? 1 : 2)
   const steps: PlanStep[] = [...agents]
     .sort((a, b) => rank(a) - rank(b))
-    .map(a => ({ title: a.title, status: a.state === 'done' ? 'done' : a.state === 'error' ? 'error' : 'active', substeps: [] }))
+    .map(a => ({
+      title: a.title,
+      status: a.state === 'done' ? 'done' : a.state === 'error' ? 'error' : 'active',
+      substeps: [],
+      startedAt: a.startedAt,
+      ...(a.endedAt === null ? {} : { endedAt: a.endedAt }),
+    }))
   const state: PlanState = isOver
     ? agents.some(a => a.state === 'error') ? 'error' : 'done'
     : agents.some(a => a.state === 'waiting') ? 'needs_input' : 'running'
@@ -544,17 +551,66 @@ async function editAgent($: EngineInterface, agentId: string, change: (a: AgentR
 
 async function hidePlan($: EngineInterface, id: string) {
   await update($, plans, list => list.map(p => (p.id === id ? { ...p, hidden: true } : p)))
+  await syncPane($)
 }
 
 async function foldFinished($: EngineInterface) {
   if (!(await read($, plans)).some(p => p.state === 'done' && !p.isFolded)) return
   await update($, plans, list => list.map(p => (p.state === 'done' && !p.isFolded ? { ...p, isFolded: true } : p)))
+  await syncPane($)
+}
+
+async function unhidePlan($: EngineInterface, id: string) {
+  await update($, plans, list => list.map(p => (p.id === id ? { ...p, hidden: false } : p)))
+  await syncPane($)
+}
+
+async function hideDone($: EngineInterface) {
+  await update($, plans, list => list.map(p => (p.state === 'done' ? { ...p, hidden: true } : p)))
+  await syncPane($)
+}
+
+async function toggleBubble($: EngineInterface, id: string) {
+  await update($, expandedIds, ids => (ids.includes(id) ? ids.filter(one => one !== id) : [...ids, id]))
+}
+
+async function togglePane($: EngineInterface, list: readonly Plan[]): Promise<boolean> {
+  pressesPending += 1
+  try {
+    return await pressPane($, list)
+  } finally {
+    pressesPending -= 1
+  }
+}
+
+async function pressPane($: EngineInterface, list: readonly Plan[]): Promise<boolean> {
+  const pane = await findPane($)
+  const isUnplaced = (await read($, paneState)) === 'unplaced'
+  const isPaneShown = isUnplaced ? list.some(isDrawn) : pane !== undefined && pane.isShown && pane.isPlaced
+  if ((await read($, isOpen)) && isPaneShown) {
+    await update($, isOpen, () => false)
+    await syncPane($)
+
+    return false
+  }
+  if (!list.some(isDrawn)) {
+    const isAllHidden = list.every(p => p.hidden)
+    await update($, plans, all => all.map(p => (isAllHidden || !p.hidden ? { ...p, hidden: false, isFolded: false } : p)))
+  }
+  if (pane !== undefined && !isUnplaced && !isPaneShown) await $.ui.close({ id: PANE }).catch(() => undefined)
+  await update($, isOpen, () => true)
+  await syncPane($, true)
+
+  return true
 }
 
 async function toggleBars($: EngineInterface): Promise<boolean> {
   const list = await read($, plans)
-  if ((await read($, isOpen)) && list.every(isDrawn)) {
+  if (await isDesktopSession($)) return togglePane($, list)
+  const isShown = (await read($, isOpen)) && list.every(isDrawn)
+  if (isShown) {
     await update($, isOpen, () => false)
+    await syncPane($)
 
     return false
   }
@@ -563,6 +619,7 @@ async function toggleBars($: EngineInterface): Promise<boolean> {
     await update($, isExpanded, () => true)
   }
   await update($, isOpen, () => true)
+  await syncPane($)
 
   return true
 }
@@ -661,7 +718,9 @@ async function replayBars($: EngineInterface): Promise<boolean> {
 async function restoreBarsOnce($: EngineInterface): Promise<void> {
   if (await read($, isRestoreChecked)) return
   const isChecked = (await read($, plans)).length > 0 || (await replayBars($))
-  if (isChecked) await update($, isRestoreChecked, () => true)
+  if (!isChecked) return
+  await update($, isRestoreChecked, () => true)
+  await syncPane($)
 }
 
 export const register: Register = on => {
@@ -674,6 +733,7 @@ export const register: Register = on => {
   let isRulesSent = false
   let hasSentBack = false
   let isPersonPrompt = false
+  let lastLiveTick = 0
 
   on('turn.start', async ($, e, next) => {
     workCalls = 0
@@ -771,7 +831,7 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.tool.register({
       name: 'plan_progress',
-      description: 'Live progress bar above the prompt, one per id. Create with title + stages; update with short ops (next, done, active, failed) or state.',
+      description: 'Live progress bar the user sees, one per id. Create with title + stages; update with short ops (next, done, active, failed) or state.',
       inputSchema: {
         type: 'object',
         required: ['id'],
@@ -794,7 +854,14 @@ export const register: Register = on => {
       },
     })
     $.clock.every(1000, async () => {
-      if (agentHome.size > 0 || (await $.clock.now()) < foldUntil) await update($, tick, n => n + 1)
+      const now = await $.clock.now()
+      if (agentHome.size > 0 || now < foldUntil) {
+        await update($, tick, n => n + 1)
+        return
+      }
+      if (now - lastLiveTick < LIVE_TICK_MS) return
+      lastLiveTick = now
+      if ((await read($, plans)).some(p => isDrawn(p) && p.state !== 'done')) await update($, tick, n => n + 1)
     })
     await $.command.register({ name: 'progress', description: 'Show or hide the progress bars' })
     await $.command.register({ name: 'progress-demo', description: 'Show a sample plan in the progress bars' })
@@ -802,8 +869,33 @@ export const register: Register = on => {
     await $.command.register({ name: 'progress-clear', description: 'Remove all progress bars' })
     const started = await next(e)
     await restoreBarsOnce($)
+    await syncPane($)
 
     return started
+  })
+
+  on('session.attach', async ($, e, next) => {
+    const attached = await next(e)
+    if (e.surface === 'desktop') await syncPane($)
+
+    return attached
+  })
+
+  on('session.detach', async ($, e, next) => {
+    const detached = await next(e)
+    if (e.surface === 'desktop') await syncPane($)
+
+    return detached
+  })
+
+  on('ui.close', async ($, e, next) => {
+    if (e.id !== PANE) return next(e)
+    if (e.origin.kind === 'person') await update($, isOpen, () => false)
+    const closed = await next(e)
+    mayBeUp = false
+    await setPaneState($, 'down')
+
+    return closed
   })
 
   on('tool.call', { tool: TOOL }, async ($, e) => {
@@ -855,12 +947,15 @@ export const register: Register = on => {
   on('command.run', { command: 'progress-demo' }, async $ => {
     await putPlan($, DEMO(await $.clock.now()))
     await update($, isOpen, () => true)
+    await syncPane($)
 
-    return { text: 'Sample plan shown above the prompt.' }
+    return { text: 'Sample plan shown.' }
   })
 
   on('command.run', { command: 'progress-clear' }, async $ => {
     await update($, plans, () => [])
+    await update($, expandedIds, () => [])
+    await syncPane($)
 
     return { text: 'Progress bars removed.' }
   })
@@ -876,87 +971,279 @@ export const register: Register = on => {
   // always drawn, so the person sees the mod is loaded; dim while there is nothing to show
   on('ui.render', { component: 'SessionMode' }, async ($, e, next) => {
     const all = await read($, plans)
-    const count = all.length
-    const isShown = (await read($, isOpen)) && all.some(isDrawn)
+    const count = all.filter(isDrawn).length
+    const isPaneDown = e.surface === 'desktop' && (await read($, paneState)) === 'down'
+    const isShown = (await read($, isOpen)) && count > 0 && !isPaneDown
     const { Box, Button } = $.ui.resolve(e)
     // other mods add their labels to modes beneath us; keep them
     const below = await next(e)
     const press = () =>
-      count === 0
+      all.length === 0
         ? $.ui.toast('plan-progress is on. A bar appears when Claude starts a task with several steps.')
         : toggleBars($)
 
     return (
       <Box flexDirection="row" alignItems="center" gap={1}>
-        <Button key="progress-toggle" dimColor={!isShown} label={count > 1 ? `Progress ${count}` : 'Progress'} onPress={press} />
+        {e.surface === 'desktop' ? (
+          <Button key="progress-toggle" plain dimColor={!isShown} label={count > 1 ? `Progress ${count}` : 'Progress'} onPress={press} />
+        ) : (
+          <Button key="progress-toggle" dimColor={!isShown} label={count > 1 ? `Progress ${count}` : 'Progress'} onPress={press} />
+        )}
         {below}
       </Box>
     )
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    const shown = (await read($, plans)).filter(isDrawn)
+    if (e.surface === 'desktop' && (await read($, paneState)) !== 'unplaced') return next(e)
+    const shown = (await read($, plans)).filter(isDrawn).slice(-MAX_BARS)
     if (shown.length === 0 || e.props.hasSurvey || !(await read($, isOpen))) return next(e)
-    const t = $.ui.resolve(e)
-    const { Box, Button, Text } = t
-    const Svg = 'Svg' in t ? t.Svg : null
-    await read($, tick)
-    const now = await $.clock.now()
+    const { Box, Button, Text } = $.ui.resolve(e)
     const isWide = await read($, isExpanded)
     const focus = focusBar(shown)
     const list = isWide || !focus ? shown : [focus]
-    const canExpand = shown.length > 1 || (e.surface === 'desktop' && shown.some(p => visibleAgents(p, now) !== null))
-    const expandLabel = isWide ? '▴' : shown.length > 1 ? `+${shown.length - 1}` : '▾'
-    const total = Math.max(320, (e.props.bodyColumns || 100) * 8)
-    // every bar has the same width and is pinned to the right edge (fixed-width percent, close button),
-    // so rows line up whatever their titles; the slack goes into the gap after the title.
-    // Desktop reports ~8 CSS px per column; glyph, gaps, percent and the close button take ~126 px.
-    const titleWidth = Math.min(Math.round(total * 0.3), Math.max(...list.map(p => Math.round(textWidth(p.title, 6.4)))))
-    const trackW = Math.max(120, Math.min(1400, total - titleWidth - 140 - (canExpand ? 28 : 0)))
-    // a hairline between task bars, so each bar and its agent strips read as one group
-    const divider = `<svg xmlns="http://www.w3.org/2000/svg" width="${total}" height="1"><rect width="${total}" height="1" fill="#808080" fill-opacity=".22"/></svg>`
 
     return (
       <Box flexDirection="column" gap={1}>
-        {list.flatMap((p, i) => {
-          const v = isWide ? visibleAgents(p, now) : null
-          const stripsH = v ? 5 + stripsHeight(v.shown.length + (v.hidden.length > 0 ? 1 : 0)) : 0
-          const source = v
-            ? `<svg xmlns="http://www.w3.org/2000/svg" width="${trackW}" height="${TRACK_H + stripsH}">${trackSvg(p, trackW)}<g transform="translate(0 ${TRACK_H + 5})">${stripsSvg(v, trackW, now)}</g></svg>`
-            : trackSvg(p, trackW)
-          const agentsAlt = v ? `; agents: ${(p.agents ?? []).map(a => `${a.title} ${a.state}`).join(', ')}` : ''
-          const line = i > 0 && Svg ? [<Svg key={`div-${p.id}`} source={divider} alt="" width={total} height={1} />] : []
+        {list.map((p, i) => {
           const w = where(p)
-          const pct = p.state === 'done' ? 100 : Math.round((Math.min(w.pos, w.total) / Math.max(1, w.total)) * 100)
+          const pct = percent(p, w)
           const color = STATE_COLOR[p.state]
           const stageName = p.stages[w.stage]?.name ?? ''
-          const alt =
-            p.state === 'done'
-              ? `${p.title}: done, ${plural(w.total, 'step')}`
-              : `${p.title}: ${stageName}, step ${w.step} of ${w.stageSize}, ${pct}%${p.note ? ` — ${p.note}` : ''}${agentsAlt}`
           const bar = `${'━'.repeat(Math.round(pct / 4))}${'─'.repeat(25 - Math.round(pct / 4))}`
 
-          return [
-            ...line,
-            <Box key={`bar-${p.id}`} flexDirection="row" alignItems={v ? 'flex-start' : 'center'} gap={1}>
+          return (
+            <Box key={`bar-${p.id}`} flexDirection="row" alignItems="center" gap={1}>
               <Text color={color}>{STATE_GLYPH[p.state]}</Text>
               <Text wrap="truncate">{p.title}</Text>
-              {i === 0 && canExpand ? [<Button key="progress-expand" plain dimColor label={expandLabel} onPress={() => update($, isExpanded, wide => !wide)} />] : []}
+              {i === 0 && shown.length > 1
+                ? [<Button key="progress-expand" plain dimColor label={isWide ? '▴' : `+${shown.length - 1}`} onPress={() => update($, isExpanded, wide => !wide)} />]
+                : []}
               <Box flexGrow={1} />
-              {Svg ? (
-                <Svg source={source} alt={alt} width={trackW} height={TRACK_H + stripsH} />
-              ) : (
-                <Text>
-                  <Text color={color}>{bar.replace(/─/g, '')}</Text>
-                  <Text dimColor>{bar.replace(/━/g, '')}</Text>
-                  <Text color={color}>{` ${stageName} ${w.step}/${w.stageSize}`}</Text>
-                </Text>
-              )}
+              <Text>
+                <Text color={color}>{bar.replace(/─/g, '')}</Text>
+                <Text dimColor>{bar.replace(/━/g, '')}</Text>
+                <Text color={color}>{` ${stageName} ${w.step}/${w.stageSize}`}</Text>
+              </Text>
               <Text dimColor>{`${String(pct).padStart(3, FIGURE_SPACE)}%`}</Text>
               <Button key={`close-${p.id}`} plain dimColor label="✕" onPress={() => hidePlan($, p.id)} />
-            </Box>,
-          ]
+            </Box>
+          )
         })}
+      </Box>
+    )
+  })
+
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    const t = $.ui.resolve(e)
+    const { Box, Button, Text } = t
+    const Svg = e.surface === 'desktop' && 'Svg' in t ? t.Svg : null
+    await read($, tick)
+    const now = await $.clock.now()
+    const kept = await read($, plans)
+    const all = kept.filter(p => !p.hidden)
+    const opened = await read($, expandedIds)
+    const isOlderShown = await read($, isHistoryOpen)
+    if (kept.length === 0) return <Text dimColor>No progress bars.</Text>
+    const isDesktop = e.surface === 'desktop'
+    const columns = e.props.bodyColumns || 40
+    const detailWidth = Math.min(1400, Math.max(120, (columns - DETAIL_INDENT - 2) * 7))
+    const byRecent = (a: Plan, b: Plan) => touchedAt(b) - touchedAt(a)
+    const live = all.filter(p => p.state !== 'done').sort(byRecent)
+    const done = all.filter(p => p.state === 'done').sort(byRecent)
+    const older = [...done.slice(RECENT_DONE), ...kept.filter(p => p.hidden)].sort(byRecent)
+    const rowFill = ROW_FILL_CHAR.repeat(Math.max(1, Math.floor(columns * ROW_FILL_PER_COLUMN)))
+
+    const heading = (key: string, text: string, top: number, extra: RenderElement[] = []) => (
+      <Box key={key} flexDirection="row" alignItems="center" paddingX={1} marginTop={top}>
+        <Text bold dimColor>
+          {text}
+        </Text>
+        <Box flexGrow={1} />
+        {extra}
+      </Box>
+    )
+
+    const stepRow = (item: Timed, key: string, depth: number, tint: string, times: Times) => {
+      const isLive = item.status === 'active' || item.status === 'error'
+      const took = times.items.get(item) ?? ''
+      const glyph = item.status === 'pending' ? <Text dimColor>{STEP_GLYPH.pending}</Text> : <Text color={stepColor(item.status, tint)}>{STEP_GLYPH[item.status]}</Text>
+
+      return (
+        <Box key={key} flexDirection="row" gap={1} marginLeft={depth * 2} minWidth={0}>
+          {glyph}
+          <Box flexGrow={1} minWidth={0}>
+            <Text bold={isLive} dimColor={!isLive} wrap="truncate">
+              {item.title}
+            </Text>
+          </Box>
+          {took ? [<Text key={`${key}-time`} dimColor>{took}</Text>] : []}
+        </Box>
+      )
+    }
+
+    const agentRows = (p: Plan) => {
+      const agents = p.agents ?? []
+      if (agents.length === 0) return []
+      return [
+        heading(`agents-${p.id}`, 'Agents', 1, [<Text key={`agents-${p.id}-count`} dimColor>{agentCounts(agents)}</Text>]),
+        ...agents.map(a => (
+          <Box key={`agent-${p.id}-${a.id}`} flexDirection="row" gap={1} paddingX={1} marginLeft={a.depth * 2} minWidth={0}>
+            <Text color={AGENT_COLOR[a.state]}>{AGENT_GLYPH[a.state]}</Text>
+            <Box flexGrow={1} minWidth={0}>
+              <Text dimColor={a.state === 'done'} wrap="truncate">
+                {a.title}
+              </Text>
+            </Box>
+            <Text dimColor>{a.tool}</Text>
+            <Text dimColor>{elapsed((a.endedAt ?? now) - a.startedAt)}</Text>
+          </Box>
+        )),
+      ]
+    }
+
+    const detail = (p: Plan) => {
+      const w = where(p)
+      const color = STATE_COLOR[p.state]
+      const times = timesOf(p, now)
+      const took = span(endOf(p, now) - p.startedAt)
+      const isSingle = p.stages.length === 1
+
+      return (
+        <Box key={`detail-${p.id}`} flexDirection="column" marginLeft={DETAIL_INDENT} marginRight={1} marginBottom={1} minWidth={0}>
+          <Text dimColor>{`${clockTime(p.startedAt)} → ${p.state === 'done' ? clockTime(touchedAt(p)) : 'now'}${took ? ` · ${took}` : ''}`}</Text>
+          {p.note
+            ? [
+                <Box key={`note-${p.id}`} paddingX={1} marginTop={1} backgroundColor={`${color}26`}>
+                  <Text color={color} wrap="wrap">
+                    {p.note}
+                  </Text>
+                </Box>,
+              ]
+            : []}
+          {Svg && p.id !== AGENTS
+            ? [
+                <Box key={`steps-${p.id}`} marginTop={1}>
+                  <Svg source={stepsSvg(p, detailWidth)} alt={`${p.title}: ${Math.min(w.pos, w.total)}/${w.total} steps`} width={detailWidth} height={SEG_H} />
+                </Box>,
+              ]
+            : []}
+          {p.id === AGENTS
+            ? []
+            : p.stages.flatMap((s, i) => {
+                const finished = s.steps.filter(step => isFinished(step.status)).length
+                const stageTime = times.stages[i] ?? ''
+                const head = isSingle
+                  ? []
+                  : [
+                      <Box key={`stage-${p.id}-${i}`} flexDirection="row" marginTop={1} minWidth={0}>
+                        <Box flexGrow={1} minWidth={0}>
+                          <Text bold dimColor wrap="truncate">
+                            {s.name}
+                          </Text>
+                        </Box>
+                        <Text dimColor>{`${finished}/${s.steps.length}${stageTime ? ` · ${stageTime}` : ''}`}</Text>
+                      </Box>,
+                    ]
+                return [
+                  ...head,
+                  ...s.steps.flatMap((step, j) => [
+                    stepRow(step, `step-${p.id}-${i}-${j}`, 0, color, times),
+                    ...step.substeps.map((sub, k) => stepRow(sub, `sub-${p.id}-${i}-${j}-${k}`, 1, color, times)),
+                  ]),
+                ]
+              })}
+          {agentRows(p)}
+          <Box flexDirection="row" marginTop={1}>
+            <Box flexGrow={1} />
+            {p.hidden ? (
+              <Button key={`close-${p.id}`} plain dimColor label="Show again" onPress={() => unhidePlan($, p.id)} />
+            ) : (
+              <Button key={`close-${p.id}`} plain dimColor label="Hide" onPress={() => hidePlan($, p.id)} />
+            )}
+          </Box>
+        </Box>
+      )
+    }
+
+    const row = (p: Plan, isCompact: boolean) => {
+      const w = where(p)
+      const pct = percent(p, w)
+      const color = STATE_COLOR[p.state]
+      const isWide = opened.includes(p.id)
+      const isAlert = p.state === 'needs_input' || p.state === 'error'
+      const toggle = () => toggleBubble($, p.id)
+      const took = shortSpan(endOf(p, now) - p.startedAt)
+      const mark = isCompact || !Svg ? <Text color={color}>{STATE_GLYPH[p.state]}</Text> : <Svg source={ringSvg(p, pct)} alt={`${p.title} ${pct}%`} width={RING} height={RING} />
+      const right = isCompact ? [clockTime(touchedAt(p))] : [took].filter(part => part !== '')
+      const line = isAlert ? (
+        <Text key={`line-${p.id}`} color={color} wrap="truncate">
+          {overview(p, w)}
+        </Text>
+      ) : (
+        <Text key={`line-${p.id}`} dimColor wrap="truncate">
+          {overview(p, w)}
+        </Text>
+      )
+
+      return [
+        <Box key={`row-${p.id}`} position="relative" flexDirection="row" alignItems="center" gap={1} paddingX={1} minWidth={0} {...(isDesktop ? {} : { hover: { backgroundColor: HOVER_BG } })}>
+          {mark}
+          <Box flexDirection="column" flexGrow={1} minWidth={0}>
+            {isDesktop ? (
+              <Text key={`title-${p.id}`} dimColor={p.state === 'done' || p.hidden === true} wrap="truncate">
+                {p.title}
+              </Text>
+            ) : (
+              <Button key={`toggle-${p.id}`} plain dimColor={p.state === 'done'} label={p.title} onPress={toggle} />
+            )}
+            {isCompact ? [] : [line]}
+          </Box>
+          <Box flexDirection="column" alignItems="flex-end">
+            {right.map((part, i) => (
+              <Text key={`right-${p.id}-${i}`} dimColor>
+                {part}
+              </Text>
+            ))}
+          </Box>
+          {isDesktop ? (
+            <Text key={`chevron-${p.id}`} dimColor>
+              {isWide ? '⌄' : '›'}
+            </Text>
+          ) : (
+            <Button key={`chevron-${p.id}`} plain dimColor label={isWide ? '▾' : '▸'} onPress={toggle} />
+          )}
+          {isDesktop ? (
+            <Box key={`hit-${p.id}`} position="absolute" top={0} bottom={0} left={0} right={0} flexDirection="row" alignItems="stretch">
+              <Button key={`toggle-${p.id}`} plain label={rowFill} onPress={toggle} />
+            </Box>
+          ) : (
+            []
+          )}
+        </Box>,
+        ...(isWide ? [detail(p)] : []),
+      ]
+    }
+
+    return (
+      <Box flexDirection="column">
+        {live.length > 0 ? [heading('live-head', `Active · ${live.length}`, 0), ...live.flatMap(p => row(p, false))] : []}
+        {done.length > 0
+          ? [
+              heading('done-head', `Done · ${done.length}`, live.length > 0 ? 1 : 0, [<Button key="hide-done" plain dimColor label="Hide all" onPress={() => hideDone($)} />]),
+              ...done.slice(0, RECENT_DONE).flatMap(p => row(p, false)),
+            ]
+          : older.length > 0
+            ? [heading('history-head', 'History', live.length > 0 ? 1 : 0)]
+            : []}
+        {isOlderShown ? older.flatMap(p => row(p, true)) : []}
+        {older.length > 0
+          ? [
+              <Box key="older-row" flexDirection="row" paddingX={1}>
+                <Button key="older" plain dimColor label={isOlderShown ? 'Show fewer' : `Show ${older.length} older`} onPress={() => update($, isHistoryOpen, shown => !shown)} />
+              </Box>,
+            ]
+          : []}
       </Box>
     )
   })
@@ -992,6 +1279,7 @@ export const register: Register = on => {
       return placeBar(list, addRun(auto, run, undefined, now))
     })
     if (isNew) await update($, isOpen, () => true)
+    await syncPane($)
 
     return started
   })

@@ -37,7 +37,7 @@ const create = ($: Engine, id: string, title = id) =>
     stages: [{ name: 'Work', steps: [{ title: 'One', status: 'active' }, { title: 'Two', status: 'pending' }] }],
   })
 
-const band = ($: Engine, surface: 'desktop' | 'terminal' = 'desktop') =>
+const band = ($: Engine, surface: 'desktop' | 'terminal' = 'terminal') =>
   $.ui.mount({ plugin: PLUGIN, surface, component: 'AbovePrompt', props: BAND_PROPS })
 
 async function drawnBars($: Engine): Promise<string[]> {
@@ -177,61 +177,9 @@ describe('collapsed band', () => {
     expect(kids[at - 1]?.type).toBe('Text')
     expect(kids[at]?.props).toMatchObject({ plain: true, dimColor: true })
   })
-
-  test('opening the band does not replay the fill glide when the bar did not move', async ($, on) => {
-    const clock = world(on)
-    await create($, 'long', 'A much longer title for this bar')
-    await clock.advance(1000)
-    await create($, 'short', 'S')
-    const fresh = await band($)
-    await fresh.unmount()
-    await $.tool.call({ tool: TOOL, id: 'short', next: true })
-    const moved = await band($)
-    expect(String((await moved.find({ type: 'Svg' }))?.props.source)).toContain('animate attributeName="width"')
-    await moved.unmount()
-    const again = await band($)
-    expect(String((await again.find({ type: 'Svg' }))?.props.source)).not.toContain('animate attributeName="width"')
-    await again.unmount()
-
-    await pressExpand($)
-    const ui = await band($)
-    const svgs = await ui.findAll({ type: 'Svg' })
-    const short = svgs.find(svg => String(svg.props.alt).startsWith('S:'))
-    expect(String(short?.props.source)).not.toContain('animate attributeName="width"')
-  })
 })
 
 describe('agent strips', () => {
-  test('agent strips draw only once the band is expanded; folded, the knob still counts them', async ($, on) => {
-    world(on)
-    await create($, 'task')
-    await spawn($, 'use-1', 'Scout')
-
-    const ui = await band($)
-    const collapsed = String((await ui.find({ type: 'Svg' }))?.props.source ?? '')
-    expect(collapsed).not.toContain('Scout')
-    expect(collapsed).toContain('0/1 agents')
-    expect((await ui.find({ type: 'Button', key: 'progress-expand' }))?.props.label).toBe('▾')
-
-    await ui.press({ key: 'progress-expand' })
-    expect(String((await ui.find({ type: 'Svg' }))?.props.source ?? '')).toContain('Scout')
-  })
-
-  test('a step update on the bar keeps its agents, and their strips still finish', async ($, on) => {
-    world(on)
-    await create($, 'task')
-    await spawn($, 'use-1', 'Scout')
-    await $.tool.call({ tool: TOOL, id: 'task', next: true })
-
-    const ui = await band($)
-    expect(String((await ui.find({ type: 'Svg' }))?.props.source ?? '')).toContain('0/1 agents')
-    await ui.unmount()
-
-    await finishAgent($, 'use-1')
-    const after = await band($)
-    expect(String((await after.find({ type: 'Svg' }))?.props.source ?? '')).toContain('1/1 agents')
-  })
-
   test('the terminal, which draws no strips, offers no expand control for a lone bar with agents', async ($, on) => {
     world(on)
     await create($, 'task')

@@ -1,6 +1,6 @@
 export type StepStatus = 'pending' | 'active' | 'done' | 'error' | 'skipped'
-export type PlanSubstep = { title: string; status: StepStatus }
-export type PlanStep = { title: string; status: StepStatus; substeps: PlanSubstep[] }
+export type PlanSubstep = { title: string; status: StepStatus; startedAt?: number; endedAt?: number }
+export type PlanStep = { title: string; status: StepStatus; substeps: PlanSubstep[]; startedAt?: number; endedAt?: number }
 export type PlanStage = { name: string; steps: PlanStep[] }
 export type PlanState = 'running' | 'needs_input' | 'error' | 'done'
 // one subagent shown as a state strip under a bar; depth 1 sits under its parent agent
@@ -34,11 +34,14 @@ declare module 'claude-code' {
     'plan-progress': {
       plans: Plan[]
       isOpen: boolean
-      // bumped every second while agents run, so elapsed times and folding redraw
+      // bumped while agents run or a bar is live, so elapsed times and folding redraw
       tick: number
       isRestoreChecked: boolean
       isExpanded: boolean
       backgroundTaskIds: string[]
+      expandedIds: string[]
+      isHistoryOpen: boolean
+      paneState: 'down' | 'up' | 'unplaced'
     }
   }
 }

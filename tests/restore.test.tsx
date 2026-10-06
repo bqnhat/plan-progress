@@ -78,7 +78,7 @@ describe('bars after a rewind or resume', () => {
     ])
     await start($)
 
-    const ui = await $.ui.mount({ plugin: 'plan-progress', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+    const ui = await $.ui.mount({ plugin: 'plan-progress', surface: 'terminal', component: 'AbovePrompt', props: BAND_PROPS })
     expect(await ui.find({ type: 'Text', text: '?' })).toBeDefined()
     await ui.unmount()
     expect((await advance($, 'task')).result).toContain('task: 1/2, running')
@@ -129,7 +129,7 @@ describe('bars after a rewind or resume', () => {
     ])
     await start($)
 
-    const ui = await $.ui.mount({ plugin: 'plan-progress', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+    const ui = await $.ui.mount({ plugin: 'plan-progress', surface: 'terminal', component: 'AbovePrompt', props: BAND_PROPS })
     expect(await ui.find({ type: 'Button', key: 'close-first' })).toBeDefined()
     expect(await ui.find({ type: 'Button', key: 'close-second' })).toBeUndefined()
   })

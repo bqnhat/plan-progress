@@ -99,7 +99,7 @@ describe('sending an unexplained open bar back', () => {
     await workTurn($, 'turn-1', 'Which file should I change next?')
 
     expect(sentBack(w)).toHaveLength(0)
-    const ui = await $.ui.mount({ plugin: 'plan-progress', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+    const ui = await $.ui.mount({ plugin: 'plan-progress', surface: 'terminal', component: 'AbovePrompt', props: BAND_PROPS })
     expect(await ui.find({ type: 'Text', text: '?' })).toBeDefined()
   })
 
@@ -185,7 +185,7 @@ describe('a turn that waits instead of leaving the bar unexplained', () => {
 
     expect(sentBack(w)).toHaveLength(0)
     expect(w.prompts.at(-1)?.context).toContain('plan-progress open bars: task (Build 1/2, needs_input)')
-    const ui = await $.ui.mount({ plugin: 'plan-progress', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+    const ui = await $.ui.mount({ plugin: 'plan-progress', surface: 'terminal', component: 'AbovePrompt', props: BAND_PROPS })
     expect(await ui.find({ type: 'Text', text: '?' })).toBeDefined()
   })
 
