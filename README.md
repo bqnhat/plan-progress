@@ -1,5 +1,7 @@
 # plan-progress
 
+> **Archived.** Development moved to [bqnhat/claude-local-plugins](https://github.com/bqnhat/claude-local-plugins/tree/main/plugins/plan-progress). This repository is read-only and stops at `0.3.0-local.15`. Install `plan-progress@nhat-local`, or `session-hub@nhat-local`, which includes it, from that marketplace.
+
 Live plan progress bars: above the Claude Code prompt in the terminal, in a Progress pane on Desktop, with stages, steps, step times and soft sounds for decision, error and done. The model creates a bar with `mcp__plan-progress__plan_progress` and moves it along as it works. Subagents are listed under the bar they were started from.
 
 A fork of [`plan-progress`](https://github.com/zycck/claude-mods/tree/ea2c96b7372b01d2d3d061597f319d531942a27c/plugins/plan-progress) 0.3.0 from zycck/claude-mods (commit `ea2c96b7372b01d2d3d061597f319d531942a27c`, MIT, by Kirill Serditov). The first commit of this repository is that upstream copy unchanged; the commits after it hold every change. The plugin keeps its name, so the tool is still `mcp__plan-progress__plan_progress`: never enable this fork and the original together.
